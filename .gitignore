@@ -1,0 +1,8 @@
+# benchmark corpora, incl. real_repos/ test clones (large; not part of the source)
+benchmarks/
+
+# build output
+/weaver
+/bin/
+knowledge/
+sources/

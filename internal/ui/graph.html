@@ -1,0 +1,919 @@
+<title>{{TITLE}}</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f5f6f4;
+    --surface: #ffffff;
+    --surface-2: #ecefea;
+    --border: #dde1da;
+    --ink: #191d17;
+    --ink-2: #565b50;
+    --ink-3: #8a8f82;
+    --accent: #e2612a;              /* warm accent */
+    --focus-ring: #e2612a;
+    /* transports — dataviz categorical slots, CVD-validated, fixed order */
+    --rest:  #2a78d6;
+    --kafka: #008300;
+    --redis: #d55181;
+    --db:    #c98500;
+    --grpc:  #1baf7a;
+    /* domain tints — one hue family per domain, kept muted (nodes read by shape+label) */
+    --d-0:       #8a6d3b;
+    --d-1:   #b8532e;
+    --d-2:    #2f7d5a;
+    --d-3: #2b6a9c;
+    --d-4:   #9c5aa8;
+    --d-5:     #b08a1e;
+    --d-6:   #6a7079;
+    --shadow: 0 1px 2px rgba(25,29,23,.05), 0 6px 22px rgba(25,29,23,.09);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --border: #363b41;
+      --ink: #e9ece8; --ink-2: #a6ac9f; --ink-3: #6e7468; --accent: #f0743c; --focus-ring: #f0743c;
+      --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c;
+    --diff-add: #37c46e; --diff-rem: #f0605f; --diff-chg: #edb24a;
+      --d-0:#c1a06a; --d-1:#e08a5f; --d-2:#5cb488; --d-3:#5b9dd0;
+      --d-4:#c891d3; --d-5:#e0bd52; --d-6:#9aa1ab;
+      --shadow: 0 1px 2px rgba(0,0,0,.35), 0 8px 26px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --border: #363b41;
+    --ink: #e9ece8; --ink-2: #a6ac9f; --ink-3: #6e7468; --accent: #f0743c; --focus-ring: #f0743c;
+    --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c;
+    --diff-add: #37c46e; --diff-rem: #f0605f; --diff-chg: #edb24a;
+    --d-0:#c1a06a; --d-1:#e08a5f; --d-2:#5cb488; --d-3:#5b9dd0;
+    --d-4:#c891d3; --d-5:#e0bd52; --d-6:#9aa1ab;
+    --shadow: 0 1px 2px rgba(0,0,0,.35), 0 8px 26px rgba(0,0,0,.4);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f5f6f4; --surface: #ffffff; --surface-2: #ecefea; --border: #dde1da;
+    --ink: #191d17; --ink-2: #565b50; --ink-3: #8a8f82; --accent: #e2612a; --focus-ring:#e2612a;
+    --rest: #2a78d6; --kafka: #008300; --redis: #d55181; --db: #c98500; --grpc: #1baf7a;
+    --diff-add: #1a9c4e; --diff-rem: #d23b3b; --diff-chg: #d98a1e;
+    --d-0:#8a6d3b; --d-1:#b8532e; --d-2:#2f7d5a; --d-3:#2b6a9c;
+    --d-4:#9c5aa8; --d-5:#b08a1e; --d-6:#6a7079;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
+    font-size: 14px; }
+  .app { display: grid; grid-template-columns: 264px 1fr 0; height: 100vh; }
+  .app.detail { grid-template-columns: 264px 1fr 320px; }
+  @media (max-width: 780px) {
+    .app, .app.detail { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    aside.rail { display: none; }
+  }
+
+  /* ---- left rail ---- */
+  aside.rail { background: var(--surface); border-right: 1px solid var(--border);
+    padding: 20px 18px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+  .brand h1 { font-size: 15px; margin: 0; letter-spacing: -.01em; }
+  .brand .sub { font-size: 11px; color: var(--ink-3); font-family: var(--mono); margin-top: 2px; }
+  .search { position: relative; }
+  .search input { width: 100%; padding: 8px 10px 8px 30px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--ink);
+    font-family: var(--mono); font-size: 12.5px; }
+  .search input:focus { outline: 2px solid var(--focus-ring); outline-offset: -1px; }
+  .search svg { position: absolute; left: 9px; top: 9px; width: 14px; height: 14px; opacity: .5; }
+
+  .eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-3); font-weight: 700; margin: 0 0 8px; }
+  .rows { display: flex; flex-direction: column; gap: 2px; }
+  .row { display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 6px;
+    cursor: pointer; user-select: none; font-size: 13px; transition: background .12s, opacity .12s; }
+  .row:hover { background: var(--surface-2); }
+  .row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .row .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+  .row .sw.ic { width: 17px; height: 17px; border-radius: 4px; display: inline-flex;
+    align-items: center; justify-content: center; }
+  .row .n { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+    font-variant-numeric: tabular-nums; }
+  .row.off { opacity: .34; }
+  .row.off .sw { background: var(--ink-3) !important; }
+  .row .k { font-family: var(--mono); font-weight: 600; text-transform: capitalize; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .stat { background: var(--surface-2); border-radius: 8px; padding: 9px 11px; }
+  .stat .v { font-size: 21px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 10.5px; color: var(--ink-2); margin-top: 1px; }
+  .foot { margin-top: auto; font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); line-height: 1.5; }
+
+  /* ---- canvas ---- */
+  main { position: relative; overflow: hidden; }
+  .topbar { position: absolute; top: 0; left: 0; right: 0; z-index: 4;
+    padding: 12px 138px 12px 16px;   /* right pad clears the 3 toolbar buttons */
+    display: flex; align-items: center; gap: 10px; pointer-events: none; }
+  .crumb { pointer-events: auto; display: flex; align-items: center; gap: 7px; font-size: 12.5px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 11px; box-shadow: var(--shadow); font-family: var(--mono); color: var(--ink-2);
+    opacity: 0; transform: translateY(-4px); transition: opacity .18s, transform .18s; }
+  .crumb.show { opacity: 1; transform: none; }
+  .crumb b { color: var(--ink); }
+  .crumb button { border: none; background: none; color: var(--accent); cursor: pointer;
+    font: inherit; padding: 0; }
+  .crumb button:hover { text-decoration: underline; }
+  .hint { pointer-events: none; margin-left: auto; font-size: 11.5px; color: var(--ink-3);
+    font-family: var(--mono); }
+  .ctrls { position: absolute; top: 12px; right: 16px; z-index: 5; display: flex; gap: 6px; }
+  .ctrls button { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--ink-2); width: 32px; height: 32px; cursor: pointer; box-shadow: var(--shadow);
+    font-size: 14px; }
+  .ctrls button:hover { color: var(--ink); }
+  .ctrls button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+
+  /* compare bar */
+  .comparebar { position: absolute; top: 54px; left: 16px; right: 16px; z-index: 5;
+    display: none; align-items: center; gap: 10px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
+    padding: 8px 12px; font-size: 12.5px; }
+  .comparebar.show { display: flex; }
+  .cb-label { font-weight: 700; text-transform: uppercase; font-size: 10px; letter-spacing: .08em; color: var(--ink-3); }
+  .comparebar select { font-family: var(--mono); font-size: 12px; padding: 4px 6px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--ink); }
+  .cb-arrow { color: var(--ink-3); }
+  .cb-legend { margin-left: auto; display: flex; gap: 12px; font-family: var(--mono); font-size: 11px; }
+  .cbl { display: flex; align-items: center; gap: 4px; }
+  .cbl.add { color: var(--diff-add); } .cbl.rem { color: var(--diff-rem); } .cbl.chg { color: var(--diff-chg); }
+  #cb-exit { border: none; background: none; color: var(--ink-3); cursor: pointer; font-size: 15px; }
+  #cb-exit:hover { color: var(--ink); }
+
+  #svg { display: block; width: 100%; height: 100%; cursor: grab; }
+  #svg.dragging { cursor: grabbing; }
+  .edge { fill: none; stroke-width: 1.4; opacity: .4; transition: opacity .15s, stroke-width .15s; }
+  .edge.hi { opacity: 1; stroke-width: 2.6; }
+  .edge.dim { opacity: .05; }
+  /* compare mode: dim unchanged, color the diff */
+  svg.compare .edge { opacity: .07; }
+  svg.compare .edge.d-add { opacity: 1; stroke: var(--diff-add) !important; stroke-width: 2.4; }
+  svg.compare .edge.d-rem { opacity: .9; stroke: var(--diff-rem) !important; stroke-width: 2.2; stroke-dasharray: 5 4; }
+  svg.compare .edge.d-chg { opacity: 1; stroke: var(--diff-chg) !important; stroke-width: 2.4; }
+  svg.compare .node { opacity: .3; }
+  svg.compare .node.d-touched { opacity: 1; }
+  .node { cursor: pointer; }
+  .node circle, .node rect { stroke: var(--surface); stroke-width: 2; transition: opacity .15s, stroke-width .15s; }
+  .node.focus circle, .node.focus rect { stroke: var(--focus-ring); stroke-width: 3; }
+  .node.infra rect { stroke: var(--surface); stroke-width: 2; }
+  .node use { pointer-events: none; color: #fff; }   /* white icon glyph inside node */
+  .node.dim { opacity: .13; }
+  .node text { font-family: var(--mono); font-size: 10.5px; font-weight: 600; fill: var(--ink);
+    paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
+    pointer-events: none; transition: opacity .15s; }
+  .node.infra text { font-weight: 700; fill: var(--ink-2); }
+  .node.dim text { opacity: .25; }
+  .arrow { transition: opacity .15s; }
+
+  .tip { position: absolute; pointer-events: none; opacity: 0; transform: translateY(3px);
+    transition: opacity .1s; background: var(--surface); border: 1px solid var(--border);
+    box-shadow: var(--shadow); border-radius: 8px; padding: 7px 10px; font-size: 12px; z-index: 6; max-width: 240px; }
+  .tip.show { opacity: 1; transform: none; }
+  .tip .kd { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700;
+    display: flex; align-items: center; gap: 5px; margin-bottom: 3px; }
+  .tip .kd .sw { width: 8px; height: 8px; border-radius: 2px; }
+  .tip .h { font-family: var(--mono); font-weight: 600; }
+  .tip .c { font-family: var(--mono); color: var(--ink-2); }
+
+  /* ---- detail panel ---- */
+  aside.detail { background: var(--surface); border-left: 1px solid var(--border);
+    overflow-y: auto; opacity: 0; transition: opacity .2s; }
+  .app.detail aside.detail { opacity: 1; }
+  .dhead { padding: 18px 18px 14px; border-bottom: 1px solid var(--border); position: sticky; top: 0;
+    background: var(--surface); }
+  .dhead .dom { display: inline-flex; align-items: center; gap: 6px; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .08em; font-weight: 700; color: var(--ink-2); }
+  .dhead .dom .sw { width: 9px; height: 9px; border-radius: 2px; }
+  .dhead h2 { font-family: var(--mono); font-size: 17px; margin: 7px 0 0; letter-spacing: -.01em;
+    word-break: break-word; }
+  .dhead .deg { margin-top: 8px; display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); }
+  .dhead .deg b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .dclose { position: absolute; top: 14px; right: 14px; border: none; background: none;
+    color: var(--ink-3); font-size: 18px; cursor: pointer; line-height: 1; }
+  .dclose:hover { color: var(--ink); }
+  .dsec { padding: 14px 18px; }
+  .dsec .eyebrow { margin-bottom: 10px; }
+  .hop { display: block; width: 100%; text-align: left; border: 1px solid var(--border);
+    background: var(--bg); border-radius: 8px; padding: 9px 11px; margin-bottom: 7px; cursor: pointer;
+    transition: border-color .12s, transform .06s; }
+  .hop:hover { border-color: var(--accent); }
+  .hop:active { transform: translateY(1px); }
+  .hop:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  .hop .top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+  .hop .kpill { font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 700;
+    color: #fff; padding: 2px 7px 2px 5px; border-radius: 4px;
+    display: inline-flex; align-items: center; gap: 4px; }
+  .tip .kd svg { vertical-align: -2px; }
+  .hop .peer { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+  .hop .ch { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); word-break: break-all; }
+  .empty { color: var(--ink-3); font-size: 12.5px; font-style: italic; }
+  /* edge-detail panel */
+  .edge-hit { cursor: pointer; }
+  .esig { font-family: var(--mono); font-size: 15px; margin: 7px 0 0; padding-left: 9px;
+    border-left: 3px solid var(--ink-3); word-break: break-all; }
+  .erow { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+  .erole { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3);
+    font-weight: 700; width: 64px; flex: none; }
+  .epeer { font-family: var(--mono); font-weight: 600; font-size: 13px; color: var(--accent);
+    background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+  .epeer:hover { text-decoration: underline; }
+  .kvs { display: flex; flex-direction: column; gap: 6px; }
+  .kv { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px;
+    border-bottom: 1px dashed var(--border); padding-bottom: 5px; }
+  .kv span { color: var(--ink-3); text-transform: uppercase; font-size: 10px; letter-spacing: .06em; font-weight: 700; }
+  .kv b { font-family: var(--mono); font-weight: 600; }
+  .contract { font-family: var(--mono); font-size: 11.5px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; overflow-x: auto; }
+  .nocontract { font-size: 12px; color: var(--ink-2); background: var(--surface-2); border-radius: 8px; padding: 11px 12px; line-height: 1.5; }
+  .nocontract span { color: var(--ink-3); font-size: 11px; }
+  .nocontract code { font-family: var(--mono); background: var(--bg); padding: 0 3px; border-radius: 3px; }
+  /* version-compare summary */
+  .cmp-h2 { font-family: var(--mono); font-size: 16px; margin: 7px 0 0; }
+  .diffrow { border-left: 3px solid var(--border); padding: 6px 0 6px 9px; margin-bottom: 6px; }
+  .diffrow.add { border-color: var(--diff-add); }
+  .diffrow.rem { border-color: var(--diff-rem); }
+  .diffrow.chg { border-color: var(--diff-chg); }
+  .dr-edge { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .dr-edge b { font-weight: 600; }
+  .dr-cause { font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+  .dr-cause .sha { font-family: var(--mono); color: var(--ink-2); }
+  .nodekey { display: flex; flex-direction: column; gap: 6px; margin-top: -8px; }
+  .nk { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); }
+  .nk-dot { width: 13px; height: 13px; background: var(--ink-3); flex: none; }
+  .nk-dot.circle { border-radius: 50%; }
+  .nk-dot.square { border-radius: 3px; }
+</style>
+
+<div class="app" id="app">
+  <aside class="rail">
+    <div class="brand">
+      <h1>Service Map</h1>
+      <div class="sub">{{SUB}}</div>
+    </div>
+
+    <div class="nodekey">
+      <span class="nk"><span class="nk-dot circle"></span>service</span>
+      <span class="nk"><span class="nk-dot square"></span>topic · store · table</span>
+    </div>
+
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+        <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="search" placeholder="find a service…" autocomplete="off" aria-label="Search services">
+    </div>
+
+    <div>
+      <p class="eyebrow">Transports</p>
+      <div class="rows" id="kinds"></div>
+    </div>
+    <div>
+      <p class="eyebrow">Domains</p>
+      <div class="rows" id="domains"></div>
+    </div>
+    <div>
+      <p class="eyebrow">Overview</p>
+      <div class="stats">
+        <div class="stat"><div class="v" id="s-nodes">0</div><div class="l">services</div></div>
+        <div class="stat"><div class="v" id="s-edges">0</div><div class="l">dependencies</div></div>
+      </div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <div class="crumb" id="crumb"><button id="crumb-all">all services</button><span>›</span><b id="crumb-node"></b></div>
+    </div>
+    <div class="ctrls">
+      <button id="history" title="Version history / compare" aria-pressed="false">⧗</button>
+      <button id="fit" title="Reset layout">⤢</button>
+      <button id="theme" title="Toggle theme">◐</button>
+    </div>
+    <div class="comparebar" id="comparebar">
+      <span class="cb-label">Compare</span>
+      <select id="cb-base" aria-label="Base version"></select>
+      <span class="cb-arrow">→</span>
+      <select id="cb-target" aria-label="Target version"></select>
+      <span class="cb-legend">
+        <span class="cbl add">+ added</span><span class="cbl rem">− removed</span><span class="cbl chg">~ changed</span>
+      </span>
+      <button id="cb-exit" title="Exit compare">✕</button>
+    </div>
+    <svg id="svg"></svg>
+    <div class="tip" id="tip"></div>
+  </main>
+
+  <aside class="detail" id="detail"></aside>
+</div>
+
+<script>
+const DATA = /*WEAVER:DATA*/null;
+const VDATA = /*WEAVER:VDATA*/null;
+const KINDS = ["rest", "kafka", "redis", "db", "grpc"];
+const DOMAINS = /*WEAVER:DOMAINS*/[];
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const kColor = k => css("--" + k);
+const kLabel = k => k === "db" ? "Database" : k;   // display name; type stays "db"
+// domains take the 7 palette colours in order (cycling past 7)
+const dColor = d => { const i = DOMAINS.indexOf(d); return i < 0 ? "" : css("--d-" + (i % 7)); };
+
+const svg = document.getElementById("svg"), tip = document.getElementById("tip");
+const app = document.getElementById("app"), detail = document.getElementById("detail");
+const NS = "http://www.w3.org/2000/svg";
+const E = (t, a) => { const e = document.createElementNS(NS, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+// model
+const nodes = DATA.nodes.map(n => ({ ...n }));
+const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+const edges = DATA.edges.map(e => ({ ...e, s: byId[e.src], t: byId[e.dst] }));
+nodes.forEach(n => { n.out = []; n.in = []; n.deg = 0; });
+edges.forEach(e => { e.s.out.push(e); e.t.in.push(e); e.s.deg++; e.t.deg++; });
+// derive per-node render props up front (before any rendering or seeding, so the
+// circle radius and icon size are never NaN/undefined at creation time)
+nodes.forEach(n => {
+  n.isInfra = n.type !== "service";
+  n.name = n.label || n.id;
+  n.r = n.isInfra ? 14 : 8 + Math.min(11, Math.sqrt(n.deg) * 3);  // radius / half-side
+});
+
+const offK = new Set(), offD = new Set();
+let focusNode = null;
+let selectedEdge = null;
+
+// transport glyphs — drawn in a 16×16 box, white 1.6px strokes for the badge.
+// rest=braces, kafka=stream/layers, redis=stacked cube, db=cylinder, grpc=plug.
+const GLYPH = {
+  rest:  '<path d="M6.2 3.5C4 3.5 4.6 7 3 8c1.6 1 1 4.5 3.2 4.5M9.8 3.5c2.2 0 1.6 3.5 3.2 4.5-1.6 1-1 4.5-3.2 4.5" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>',
+  kafka: '<circle cx="4" cy="8" r="1.7" fill="#fff"/><circle cx="11.5" cy="4.5" r="1.7" fill="#fff"/><circle cx="11.5" cy="11.5" r="1.7" fill="#fff"/><path d="M5.4 7.2 10.1 5.2M5.4 8.8 10.1 10.8" fill="none" stroke="#fff" stroke-width="1.4" stroke-linecap="round"/>',
+  redis: '<path d="M8 3 3.2 5.2 8 7.4l4.8-2.2L8 3ZM3.2 8 8 10.2 12.8 8M3.2 10.8 8 13l4.8-2.2" fill="none" stroke="#fff" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>',
+  db:    '<path d="M4 4.2c0 1 1.8 1.8 4 1.8s4-.8 4-1.8-1.8-1.8-4-1.8-4 .8-4 1.8ZM4 4.2v7.6c0 1 1.8 1.8 4 1.8s4-.8 4-1.8V4.2M4 8c0 1 1.8 1.8 4 1.8s4-.8 4-1.8" fill="none" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/>',
+  grpc:  '<path d="M8 2.5v3M8 10.5v3M4 5.5h8v3a4 4 0 0 1-8 0v-3ZM6 5.5v-1M10 5.5v-1" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>',
+  // service = a box/container (deployable unit)
+  service: '<rect x="3" y="3.5" width="10" height="9" rx="1.4" fill="none" stroke="#fff" stroke-width="1.5"/><path d="M3 6.5h10M6 3.5v3" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>',
+};
+// node-type icons: services use the box; infra nodes reuse their transport glyph.
+const NODE_ICON = { service: "service", kafka: "kafka", redis: "redis", db: "db", grpc: "grpc" };
+// defs: one arrowhead per transport + a reusable icon <symbol> per transport
+const defs = E("defs", {}); svg.appendChild(defs);
+KINDS.forEach(k => {
+  const m = E("marker", { id: "a-" + k, viewBox: "0 0 10 10", refX: 8.5, refY: 5,
+    markerWidth: 6.5, markerHeight: 6.5, orient: "auto-start-reverse" });
+  m.appendChild(E("path", { d: "M0,0 L10,5 L0,10 z", class: "arrow", fill: kColor(k) }));
+  defs.appendChild(m);
+  const sym = E("symbol", { id: "ic-" + k, viewBox: "0 0 16 16" });
+  sym.innerHTML = GLYPH[k];
+  defs.appendChild(sym);
+});
+const svcSym = E("symbol", { id: "ic-service", viewBox: "0 0 16 16" });
+svcSym.innerHTML = GLYPH.service;
+defs.appendChild(svcSym);
+// small inline icon for HTML chrome (tooltip / detail pills / rail rows)
+function iconSVG(k, size, stroke) {
+  return `<svg viewBox="0 0 16 16" width="${size}" height="${size}" style="flex:none">` +
+    GLYPH[k].replace(/#fff/g, stroke || "currentColor") + `</svg>`;
+}
+// viewport: one transform group holds edges + nodes; pan/zoom move this, not the SVG.
+const gView = E("g", { id: "viewport" }); svg.appendChild(gView);
+const gE = E("g", {}); gView.appendChild(gE);
+const gN = E("g", {}); gView.appendChild(gN);
+let view = { k: 1, x: 0, y: 0 };   // scale, pan-x, pan-y
+function applyView() { gView.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`); }
+// screen (client) coords -> graph coords (undo the viewport transform)
+function toGraph(clientX, clientY) {
+  const r = svg.getBoundingClientRect();
+  return { x: (clientX - r.left - view.x) / view.k, y: (clientY - r.top - view.y) / view.k };
+}
+
+// ---- layout: force with per-domain clustering pull ----
+let W = 800, H = 600;
+const DOM_ANGLE = {}; DOMAINS.forEach((d, i) => DOM_ANGLE[d] = (i / DOMAINS.length) * Math.PI * 2);
+function seed() {
+  const cx = W/2, cy = H/2, rr = Math.min(W, H) * 0.34;
+  nodes.forEach(n => {
+    // infra nodes have no domain — scatter them near center (connective tissue)
+    const a = DOM_ANGLE[n.domain] ?? (Math.random() * Math.PI * 2);
+    const ring = n.isInfra ? rr * 0.35 : rr;
+    const jitter = (Math.random() - 0.5);
+    n.x = cx + (ring + jitter*60) * Math.cos(a + jitter*0.5);
+    n.y = cy + (ring + jitter*60) * Math.sin(a + jitter*0.5);
+  });
+}
+function tick() {
+  const k = Math.sqrt((W*H)/nodes.length) * 0.52;
+  for (const a of nodes) { a.fx = 0; a.fy = 0; }
+  for (let i=0;i<nodes.length;i++) for (let j=i+1;j<nodes.length;j++) {
+    const a=nodes[i], b=nodes[j]; let dx=a.x-b.x, dy=a.y-b.y, d=Math.hypot(dx,dy)||1;
+    const rep=(k*k)/d; dx/=d; dy/=d; a.fx+=dx*rep; a.fy+=dy*rep; b.fx-=dx*rep; b.fy-=dy*rep;
+  }
+  for (const e of edges) {
+    let dx=e.t.x-e.s.x, dy=e.t.y-e.s.y, d=Math.hypot(dx,dy)||1;
+    const att=(d*d)/k*0.9; dx/=d; dy/=d;
+    e.s.fx+=dx*att; e.s.fy+=dy*att; e.t.fx-=dx*att; e.t.fy-=dy*att;
+  }
+  // gentle pull toward each domain's sector centroid, keeps clusters legible
+  const cx=W/2, cy=H/2, rr=Math.min(W,H)*0.32;
+  for (const a of nodes) {
+    const ang = DOM_ANGLE[a.domain] ?? 0;
+    const tx = cx + rr*Math.cos(ang), ty = cy + rr*Math.sin(ang);
+    a.fx += (tx - a.x) * 0.02; a.fy += (ty - a.y) * 0.02;
+    a.fx += (cx - a.x) * 0.004; a.fy += (cy - a.y) * 0.004;
+    if (a.pin) continue;
+    a.x += Math.max(-16, Math.min(16, a.fx*0.018));
+    a.y += Math.max(-16, Math.min(16, a.fy*0.018));
+    a.x = Math.max(a.r+30, Math.min(W-a.r-30, a.x));
+    a.y = Math.max(a.r+40, Math.min(H-a.r-24, a.y));
+  }
+}
+
+// ---- render ----
+function geom(e) {
+  const sib = edges.filter(o => o.s===e.s && o.t===e.t);
+  const idx = sib.indexOf(e), n = sib.length;
+  const mx=(e.s.x+e.t.x)/2, my=(e.s.y+e.t.y)/2;
+  let dx=e.t.x-e.s.x, dy=e.t.y-e.s.y, len=Math.hypot(dx,dy)||1;
+  const nx=-dy/len, ny=dx/len, spread=(idx-(n-1)/2)*22;
+  const cxp=mx+nx*spread, cyp=my+ny*spread;
+  const a2=Math.atan2(cyp-e.s.y,cxp-e.s.x), b2=Math.atan2(cyp-e.t.y,cxp-e.t.x);
+  const sx=e.s.x+Math.cos(a2)*e.s.r, sy=e.s.y+Math.sin(a2)*e.s.r;
+  const tx=e.t.x+Math.cos(b2)*e.t.r, ty=e.t.y+Math.sin(b2)*e.t.r;
+  // midpoint of the quadratic Bézier (t=0.5)
+  const bx = 0.25*sx + 0.5*cxp + 0.25*tx, by = 0.25*sy + 0.5*cyp + 0.25*ty;
+  return { d: `M${sx},${sy} Q${cxp},${cyp} ${tx},${ty}`, bx, by };
+}
+// Transport identity lives on the edge color + the infra node the edge points to
+// (a kafka/redis/db edge terminates at an iconned infra node), so per-edge icon
+// badges were removed — they tripled the same signal and cluttered the graph.
+edges.forEach(e => {
+  // invisible fat path = a comfortable click/hover target over the thin visible line
+  e.hit = E("path", { class: "edge-hit", stroke: "transparent", "stroke-width": 12, fill: "none" });
+  e.el = E("path", { class: "edge", stroke: kColor(e.kind), "marker-end": "url(#a-"+e.kind+")" });
+  const enter = ev => edgeTip(ev, e), leave = hideTip, sel = ev => { ev.stopPropagation(); selectEdge(e); };
+  e.hit.addEventListener("mousemove", enter);
+  e.hit.addEventListener("mouseleave", leave);
+  e.hit.addEventListener("click", sel);
+  gE.appendChild(e.hit);
+  gE.appendChild(e.el);
+});
+function nodeFill(n) { return n.type === "service" ? dColor(n.domain) : kColor(n.type); }
+nodes.forEach(n => {
+  n.el = E("g", { class: "node" + (n.isInfra ? " infra" : ""), tabindex: "0",
+    role: "button", "aria-label": (n.isInfra ? kLabel(n.type) + " " : "") + n.name });
+  // shape: services = circle, infra (kafka/redis/db/…) = rounded square
+  if (n.isInfra) {
+    n.shape = E("rect", { fill: nodeFill(n), rx: 3,
+      x: -n.r, y: -n.r, width: 2*n.r, height: 2*n.r });
+  } else {
+    n.shape = E("circle", { r: n.r, fill: nodeFill(n) });
+  }
+  n.el.appendChild(n.shape);
+  n.circle = n.shape;  // back-compat for theme recolor
+  // white icon centered inside the node
+  const icName = NODE_ICON[n.type] || "service";
+  const ic = Math.max(11, n.r * 1.05);   // icon draw size (always valid: n.r set above)
+  n.icon = E("use", { href: "#ic-" + icName, x: -ic/2, y: -ic/2, width: ic, height: ic });
+  n.icon.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#ic-" + icName);
+  n.el.appendChild(n.icon);
+  n.labelEl = E("text", { "text-anchor": "middle", dy: n.r + 12 });
+  n.labelEl.textContent = n.name.replace(/_service$/, "").replace(/_/g, " ");
+  n.el.appendChild(n.labelEl);
+  n.el.addEventListener("click", ev => { ev.stopPropagation(); drill(n); });
+  n.el.addEventListener("keydown", ev => { if (ev.key==="Enter"||ev.key===" ") { ev.preventDefault(); drill(n); } });
+  n.el.addEventListener("mouseenter", () => { if (!focusNode) hover(n, true); });
+  n.el.addEventListener("mouseleave", () => { if (!focusNode) hover(n, false); });
+  gN.appendChild(n.el);
+  dragify(n);
+});
+// ---- pan (drag background) + zoom (wheel) ----
+let panning = false, panStart = null, panned = false;
+svg.addEventListener("mousedown", ev => {
+  if (ev.target.closest(".node")) return;         // node drag handles itself
+  panning = true; panned = false;
+  panStart = { x: ev.clientX - view.x, y: ev.clientY - view.y };
+  svg.classList.add("dragging");
+});
+window.addEventListener("mousemove", ev => {
+  if (!panning) return;
+  panned = true;
+  view.x = ev.clientX - panStart.x; view.y = ev.clientY - panStart.y;
+  applyView();
+});
+window.addEventListener("mouseup", () => {
+  if (!panning) return; panning = false; svg.classList.remove("dragging");
+});
+svg.addEventListener("click", ev => {
+  if (panned || ev.target.closest(".node") || ev.target.closest(".edge-hit")) return;
+  drill(null);  // a plain click on empty canvas backs out
+});
+svg.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = svg.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const factor = Math.exp(-ev.deltaY * 0.0015);
+  const k2 = Math.max(0.3, Math.min(4, view.k * factor));
+  // zoom toward the cursor: keep the graph point under the pointer fixed
+  const gx = (mx - view.x) / view.k, gy = (my - view.y) / view.k;
+  view.k = k2; view.x = mx - gx * k2; view.y = my - gy * k2;
+  applyView();
+}, { passive: false });
+
+function draw() {
+  edges.forEach(e => { const d = geom(e).d; e.el.setAttribute("d", d); e.hit.setAttribute("d", d); });
+  nodes.forEach(n => n.el.setAttribute("transform", `translate(${n.x},${n.y})`));
+}
+
+function syncBadges() {}  // badges removed; kept as no-op so call sites stay simple
+
+// ---- filter (transport + domain) ----
+function edgeVisible(e) { return !offK.has(e.kind) && !offD.has(e.s.domain) && !offD.has(e.t.domain); }
+function applyFilter() {
+  const liveNodes = new Set();
+  edges.forEach(e => {
+    const v = edgeVisible(e);
+    e.el.style.display = v ? "" : "none";
+    if (v) { liveNodes.add(e.s.id); liveNodes.add(e.t.id); }
+  });
+  nodes.forEach(n => {
+    // service hidden by domain filter; infra node hidden when its transport is off
+    const hidden = n.isInfra ? offK.has(n.type) : offD.has(n.domain);
+    n.el.style.display = hidden ? "none" : "";
+  });
+  document.getElementById("s-edges").textContent = edges.filter(edgeVisible).length;
+  document.getElementById("s-nodes").textContent =
+    nodes.filter(n => n.type === "service" && !offD.has(n.domain)).length;
+  if (focusNode) applyFocus(focusNode);
+  syncBadges();
+}
+
+// ---- hover (transient neighborhood highlight when NOT drilled) ----
+function hover(n, on) {
+  if (on) {
+    const nb = new Set([n.id]);
+    n.out.concat(n.in).forEach(e => { nb.add(e.s.id); nb.add(e.t.id); });
+    nodes.forEach(m => m.el.classList.toggle("dim", !nb.has(m.id)));
+    edges.forEach(e => {
+      const touch = e.s===n || e.t===n;
+      e.el.classList.toggle("hi", touch);
+      e.el.classList.toggle("dim", !touch);
+    });
+    syncBadges();
+  } else if (!focusNode) { clearHi(); }
+}
+function clearHi() {
+  nodes.forEach(m => m.el.classList.remove("dim"));
+  edges.forEach(e => { e.el.classList.remove("hi","dim"); });
+  syncBadges();
+}
+
+// ---- drill-down ----
+function drill(n) {
+  focusNode = n;
+  selectedEdge = null;                    // node drill supersedes any edge selection
+  nodes.forEach(m => m.el.classList.toggle("focus", m === n));
+  if (n) { applyFocus(n); openDetail(n); }
+  else { clearHi(); closeDetail(); }
+  const crumb = document.getElementById("crumb");
+  crumb.classList.toggle("show", !!n);
+  if (n) document.getElementById("crumb-node").textContent = n.name || n.id;
+}
+function applyFocus(n) {
+  const nb = new Set([n.id]);
+  n.out.concat(n.in).forEach(e => { if (edgeVisible(e)) { nb.add(e.s.id); nb.add(e.t.id); } });
+  nodes.forEach(m => { if (m.el.style.display !== "none") m.el.classList.toggle("dim", !nb.has(m.id)); });
+  edges.forEach(e => {
+    if (e.el.style.display === "none") return;
+    const touch = (e.s===n || e.t===n);
+    e.el.classList.toggle("hi", touch);
+    e.el.classList.toggle("dim", !touch);
+  });
+  syncBadges();
+}
+
+// ---- detail panel ----
+function hopRow(e, dir) {
+  const peer = dir === "out" ? e.t : e.s;
+  const b = document.createElement("button");
+  b.className = "hop";
+  const arrow = dir === "out" ? "→" : "←";
+  b.innerHTML =
+    `<div class="top"><span class="kpill" style="background:${kColor(e.kind)}">` +
+    `${iconSVG(e.kind, 11, "#fff")}${e.kind}</span>` +
+    `<span class="peer">${arrow} ${esc(peer.name || peer.id)}</span></div>` +
+    `<div class="ch">${esc(e.channel)}</div>`;
+  b.addEventListener("click", ev => { ev.stopPropagation(); drill(peer); });
+  return b;
+}
+function openDetail(n) {
+  app.classList.add("detail");
+  const outE = n.out.filter(edgeVisible), inE = n.in.filter(edgeVisible);
+  const sec = (title, list, dir) => {
+    if (!list.length) return `<div class="dsec"><p class="eyebrow">${title}</p><div class="empty">none</div></div>`;
+    return `<div class="dsec"><p class="eyebrow">${title} · ${list.length}</p><div id="sec-${dir}"></div></div>`;
+  };
+  // header + section labels differ for infra nodes (a broker/store, not a caller)
+  const kind = n.isInfra
+    ? `<span class="dom" style="color:${kColor(n.type)}">${iconSVG(n.type, 11, kColor(n.type))}${kLabel(n.type)}</span>`
+    : `<span class="dom"><span class="sw" style="background:${dColor(n.domain)}"></span>${n.domain}</span>`;
+  const outTitle = n.isInfra ? "Delivers to (consumers)" : "Calls (outbound)";
+  const inTitle  = n.isInfra ? "Fed by (producers)" : "Called by (inbound)";
+  detail.innerHTML =
+    `<div class="dhead"><button class="dclose" id="dclose" aria-label="Close">✕</button>` +
+    kind +
+    `<h2>${esc(n.name || n.id)}</h2>` +
+    `<div class="deg"><span><b>${inE.length}</b> inbound</span><span><b>${outE.length}</b> outbound</span></div></div>` +
+    sec(outTitle, outE, "out") +
+    sec(inTitle, inE, "in");
+  const so = detail.querySelector("#sec-out"), si = detail.querySelector("#sec-in");
+  if (so) outE.forEach(e => so.appendChild(hopRow(e, "out")));
+  if (si) inE.forEach(e => si.appendChild(hopRow(e, "in")));
+  detail.querySelector("#dclose").addEventListener("click", ev => { ev.stopPropagation(); drill(null); });
+}
+function closeDetail() { app.classList.remove("detail"); }
+
+// ---- edge selection: click an edge -> focus it + its two endpoints, show the
+//      call detail (method/stub/topic + contract) in the panel ----
+function selectEdge(e) {
+  focusNode = null;
+  selectedEdge = e;
+  nodes.forEach(m => { m.el.classList.remove("focus");
+    m.el.classList.toggle("dim", m !== e.s && m !== e.t && m.el.style.display !== "none"); });
+  edges.forEach(x => {
+    if (x.el.style.display === "none") return;
+    x.el.classList.toggle("hi", x === e);
+    x.el.classList.toggle("dim", x !== e);
+  });
+  openEdgeDetail(e);
+  const crumb = document.getElementById("crumb");
+  crumb.classList.add("show");
+  document.getElementById("crumb-node").textContent = `${e.s.name || e.s.id} → ${e.t.name || e.t.id}`;
+}
+function openEdgeDetail(e) {
+  app.classList.add("detail");
+  const c = kColor(e.kind);
+  // what to call the two ends, per transport
+  const roleFor = {
+    rest:  ["caller", "server"], grpc: ["client", "server"],
+    kafka: ["producer", "consumer"], redis: ["writer", "reader"], db: ["writer", "reader"],
+  }[e.kind] || ["source", "target"];
+  const endRow = (label, node) =>
+    `<div class="erow"><span class="erole">${label}</span>` +
+    `<button class="epeer" data-id="${esc(node.id)}">${esc(node.name || node.id)}</button></div>`;
+  const contract = e.contract
+    ? `<pre class="contract">${esc(e.contract)}</pre>`
+    : `<div class="nocontract">Request/response schema not captured.<br>` +
+      `<span>Needs OpenAPI (REST) or <code>.proto</code> (gRPC) source — the extractor ` +
+      `sees the call site, not the contract.</span></div>`;
+  detail.innerHTML =
+    `<div class="dhead"><button class="dclose" id="dclose" aria-label="Close">✕</button>` +
+    `<span class="dom" style="color:${c}">${iconSVG(e.kind, 11, c)}${e.kind} call</span>` +
+    `<h2 class="esig" style="border-color:${c}">${esc(e.signature || e.channel)}</h2></div>` +
+    `<div class="dsec"><p class="eyebrow">Endpoints</p>` +
+    endRow(roleFor[0], e.s) + endRow(roleFor[1], e.t) + `</div>` +
+    `<div class="dsec"><p class="eyebrow">Interface</p>` +
+    `<div class="kvs">` +
+    `<div class="kv"><span>transport</span><b>${e.kind}</b></div>` +
+    `<div class="kv"><span>${e.kind==="rest"?"method":e.kind==="grpc"?"stub":"channel"}</span>` +
+      `<b>${esc(e.method || "—")}</b></div>` +
+    `<div class="kv"><span>${e.kind==="rest"?"path":e.kind==="grpc"?"service":"name"}</span>` +
+      `<b>${esc(e.channel)}</b></div>` +
+    `</div></div>` +
+    `<div class="dsec"><p class="eyebrow">Contract</p>${contract}</div>`;
+  detail.querySelector("#dclose").addEventListener("click", ev => { ev.stopPropagation(); clearSelection(); });
+  detail.querySelectorAll(".epeer").forEach(b =>
+    b.addEventListener("click", ev => { ev.stopPropagation(); drill(byId[b.dataset.id]); }));
+}
+function clearSelection() { selectedEdge = null; drill(null); }
+
+// ---- edge tooltip ----
+function edgeTip(ev, e) {
+  tip.innerHTML =
+    `<div class="kd" style="color:${kColor(e.kind)}">${iconSVG(e.kind, 12)}${e.kind}</div>` +
+    `<div class="h">${esc(e.s.id)} → ${esc(e.t.id)}</div><div class="c">${esc(e.channel)}</div>`;
+  const r = svg.getBoundingClientRect();
+  tip.style.left = (ev.clientX - r.left + 13) + "px";
+  tip.style.top = (ev.clientY - r.top + 13) + "px";
+  tip.classList.add("show");
+}
+function hideTip() { tip.classList.remove("show"); }
+
+// ---- node drag (in graph space, so it works under any pan/zoom) ----
+function dragify(n) {
+  let down = false;
+  n.el.addEventListener("mousedown", ev => { down = true; n.pin = true;
+    svg.classList.add("dragging"); ev.stopPropagation(); ev.preventDefault(); });
+  window.addEventListener("mousemove", ev => {
+    if (!down) return;
+    const p = toGraph(ev.clientX, ev.clientY); n.x = p.x; n.y = p.y; draw();
+  });
+  window.addEventListener("mouseup", () => { if (!down) return; down = false; n.pin = false;
+    svg.classList.remove("dragging"); });
+}
+
+// ---- rail: transports + domains + search ----
+function buildRows(elId, items, colorFn, offSet, withIcon) {
+  const box = document.getElementById(elId);
+  items.forEach(it => {
+    const count = it.count;
+    const r = document.createElement("div");
+    r.className = "row"; r.tabIndex = 0; r.setAttribute("role","switch"); r.setAttribute("aria-checked","true");
+    const swatch = withIcon
+      ? `<span class="sw ic" style="background:${colorFn(it.id)}">${iconSVG(it.id, 10, "#fff")}</span>`
+      : `<span class="sw" style="background:${colorFn(it.id)}"></span>`;
+    r.innerHTML = swatch + `<span class="k">${kLabel(it.id)}</span><span class="n">${count}</span>`;
+    const toggle = () => { offSet.has(it.id) ? offSet.delete(it.id) : offSet.add(it.id);
+      r.classList.toggle("off", offSet.has(it.id)); r.setAttribute("aria-checked", String(!offSet.has(it.id)));
+      applyFilter(); };
+    r.addEventListener("click", toggle);
+    r.addEventListener("keydown", e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); toggle(); } });
+    box.appendChild(r);
+  });
+}
+const kCount = Object.fromEntries(KINDS.map(k => [k, edges.filter(e => e.kind===k).length]));
+buildRows("kinds", KINDS.map(k => ({ id: k, count: kCount[k] || 0 })), kColor, offK, true);
+const dCount = Object.fromEntries(DOMAINS.map(d => [d, nodes.filter(n => n.domain===d).length]));
+buildRows("domains", DOMAINS.map(d => ({ id: d, count: dCount[d] || 0 })), dColor, offD, false);
+
+// search: enter drills to best match; live-dims non-matches
+const searchEl = document.getElementById("search");
+searchEl.addEventListener("input", () => {
+  const q = searchEl.value.trim().toLowerCase();
+  if (!q) { if (!focusNode) clearHi(); return; }
+  const match = n => n.id.toLowerCase().includes(q) || (n.name || "").toLowerCase().includes(q);
+  nodes.forEach(n => n.el.classList.toggle("dim", !match(n)));
+  edges.forEach(e => e.el.classList.add("dim"));
+});
+searchEl.addEventListener("keydown", ev => {
+  if (ev.key !== "Enter") return;
+  const q = searchEl.value.trim().toLowerCase();
+  const hit = nodes.find(n => (n.name || n.id).toLowerCase() === q)
+    || nodes.find(n => n.id.toLowerCase().includes(q) || (n.name || "").toLowerCase().includes(q));
+  if (hit) { drill(hit); searchEl.value = ""; }
+});
+
+// ---- controls ----
+document.getElementById("crumb-all").addEventListener("click", ev => { ev.stopPropagation(); drill(null); });
+document.getElementById("fit").addEventListener("click", () => {
+  view = { k: 1, x: 0, y: 0 }; applyView();
+  resize(); seed(); relax(320); drill(null);
+});
+document.getElementById("theme").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  KINDS.forEach(k => defs.querySelector("#a-"+k+" path").setAttribute("fill", kColor(k)));
+  edges.forEach(e => e.el.setAttribute("stroke", kColor(e.kind)));
+  nodes.forEach(n => n.shape.setAttribute("fill", nodeFill(n)));
+  document.querySelectorAll(".rows").forEach(() => {});
+  document.querySelectorAll("#kinds .row .sw").forEach((s,i)=>{ if(!offK.has(KINDS[i])) s.style.background=kColor(KINDS[i]); });
+  document.querySelectorAll("#domains .row .sw").forEach((s,i)=>{ if(!offD.has(DOMAINS[i])) s.style.background=dColor(DOMAINS[i]); });
+  if (focusNode) openDetail(focusNode);   // re-render panel colors
+});
+window.addEventListener("keydown", ev => { if (ev.key === "Escape") { drill(null); if (compareOn) exitCompare(); } });
+
+// ---- version history / visual compare ----
+let compareOn = false;
+const VERS = VDATA.versions;                 // [{version, ts, commits, edges:[[s,d,k,ch],...]}]
+const ekey = a => a.join("|");               // edge key from [s,d,k,ch]
+function versionEdgeSet(v) { return new Set(v.edges.map(ekey)); }
+
+// added / removed / changed between any two versions, each attributed to the
+// endpoint whose commit moved (producer first) — same rules as weaver's diff.
+function pairDiff(base, target) {
+  const A = versionEdgeSet(base), B = versionEdgeSet(target);
+  const obj = a => ({ src: a[0], dst: a[1], kind: a[2], channel: a[3] });
+  const cause = (s, d) => {
+    const moved = [s, d].find(r => (base.commits[r] || "") !== (target.commits[r] || ""));
+    const r = moved || s;
+    return { repo: r, from: base.commits[r] || "-", to: target.commits[r] || "-" };
+  };
+  const byTriple = v => { const m = {}; v.edges.forEach(a => { const t = a.slice(0, 3).join("|"); (m[t] = m[t] || []).push(a[3]); }); return m; };
+  const ta = byTriple(base), tb = byTriple(target), changed = [], moved = new Set();
+  Object.keys(ta).filter(t => tb[t]).sort().forEach(t => {
+    const gone = ta[t].filter(c => !tb[t].includes(c)).sort(), came = tb[t].filter(c => !ta[t].includes(c)).sort();
+    for (let i = 0; i < Math.min(gone.length, came.length); i++) {
+      const [src, dst, kind] = t.split("|");
+      changed.push({ src, dst, kind, from_channel: gone[i], to_channel: came[i], cause: cause(src, dst) });
+      moved.add([src, dst, kind, gone[i]].join("|")); moved.add([src, dst, kind, came[i]].join("|"));
+    }
+  });
+  const side = (X, Y) => [...X].filter(k => !Y.has(k) && !moved.has(k)).sort()
+    .map(k => { const e = obj(k.split("|")); e.cause = cause(e.src, e.dst); return e; });
+  return { added: side(B, A), removed: side(A, B), changed };
+}
+
+// compute this graph's per-edge diff status between base->target versions.
+function computeDiff(base, target, pd) {
+  const A = versionEdgeSet(base), B = versionEdgeSet(target);
+  const changedFrom = new Set(), changedTo = new Set();
+  pd.changed.forEach(c => {
+    changedFrom.add(ekey([c.src, c.dst, c.kind, c.from_channel]));
+    changedTo.add(ekey([c.src, c.dst, c.kind, c.to_channel]));
+  });
+  // status for each edge currently drawn (edges array = target/current graph)
+  // plus removed edges that aren't drawn -> we add ghost paths for them.
+  return { A, B, changedFrom, changedTo };
+}
+
+function statusOf(e, d) {
+  // e is a live edge (in current DATA = target). Infra split edges use channel too.
+  const k = ekey([e.src, e.dst, e.kind, e.channel]);
+  if (d.changedTo.has(k)) return "chg";
+  if (d.B.has(k) && !d.A.has(k)) return "add";
+  return "unchanged";
+}
+
+let ghostEls = [];
+function enterCompare(baseV, targetV) {
+  compareOn = true;
+  drill(null);
+  const base = VERS.find(v => v.version === baseV), target = VERS.find(v => v.version === targetV);
+  const pd = pairDiff(base, target);
+  const d = computeDiff(base, target, pd);
+  svg.classList.add("compare");
+  const touched = new Set();
+  // color live edges (adds / changes) + collect touched nodes
+  edges.forEach(e => {
+    e.el.classList.remove("d-add", "d-rem", "d-chg");
+    const s = statusOf(e, d);
+    if (s === "add") { e.el.classList.add("d-add"); touched.add(e.s.id); touched.add(e.t.id); }
+    else if (s === "chg") { e.el.classList.add("d-chg"); touched.add(e.s.id); touched.add(e.t.id); }
+  });
+  // removed edges aren't in the current graph -> draw dashed ghost paths for them
+  clearGhosts();
+  pd.removed.forEach(r => {
+    const s = byId[r.src], t = byId[r.dst];
+    if (!s || !t) return;
+    const g = geom({ s, t, kind: r.kind, channel: r.channel });
+    const p = E("path", { class: "edge d-rem", d: g.d });
+    gE.appendChild(p); ghostEls.push(p);
+    touched.add(s.id); touched.add(t.id);
+  });
+  nodes.forEach(n => n.el.classList.toggle("d-touched", touched.has(n.id)));
+  showDiffSummary(base, target, pd);
+}
+function clearGhosts() { ghostEls.forEach(p => p.remove()); ghostEls = []; }
+function exitCompare() {
+  compareOn = false;
+  svg.classList.remove("compare");
+  edges.forEach(e => e.el.classList.remove("d-add", "d-rem", "d-chg"));
+  nodes.forEach(n => n.el.classList.remove("d-touched"));
+  clearGhosts();
+  document.getElementById("comparebar").classList.remove("show");
+  document.getElementById("history").setAttribute("aria-pressed", "false");
+  closeDetail();
+}
+
+function showDiffSummary(base, target, d) {
+  app.classList.add("detail");
+  const causeStr = c => c && c.repo ? `${esc(c.repo)} <span class="sha">${esc(c.from)}→${esc(c.to)}</span>` : "—";
+  const rows = (title, list, cls, fmt) => list.length
+    ? `<div class="dsec"><p class="eyebrow">${title} · ${list.length}</p>` +
+      list.map(e => `<div class="diffrow ${cls}"><div class="dr-edge">${fmt(e)}</div>` +
+        `<div class="dr-cause">${causeStr(e.cause)}</div></div>`).join("") + `</div>`
+    : "";
+  detail.innerHTML =
+    `<div class="dhead"><button class="dclose" id="dclose" aria-label="Close">✕</button>` +
+    `<span class="dom">version compare</span>` +
+    `<h2 class="cmp-h2">v${base.version} → v${target.version}</h2>` +
+    `<div class="deg"><span>${esc(base.ts.slice(0,10))}</span><span>→</span><span>${esc(target.ts.slice(0,10))}</span></div></div>` +
+    rows("Added", d.added, "add", e => `${esc(e.src)} → ${esc(e.dst)} <b>${esc(e.kind)} ${esc(e.channel)}</b>`) +
+    rows("Removed", d.removed, "rem", e => `${esc(e.src)} → ${esc(e.dst)} <b>${esc(e.kind)} ${esc(e.channel)}</b>`) +
+    rows("Changed", d.changed, "chg", e => `${esc(e.src)} → ${esc(e.dst)} <b>${esc(e.from_channel)} → ${esc(e.to_channel)}</b>`) +
+    (d.added.length+d.removed.length+d.changed.length===0 ? `<div class="dsec"><div class="empty">no graph changes</div></div>` : "");
+  detail.querySelector("#dclose").addEventListener("click", ev => { ev.stopPropagation(); exitCompare(); });
+}
+
+// wire the compare bar
+const cbBase = document.getElementById("cb-base"), cbTarget = document.getElementById("cb-target");
+VERS.forEach((v, i) => {
+  const label = `v${v.version} · ${v.ts.slice(0,10)}`;
+  cbBase.add(new Option(label, v.version, i===0, i===0));
+  cbTarget.add(new Option(label, v.version, i===VERS.length-1, i===VERS.length-1));
+});
+function runCompare() {
+  enterCompare(parseInt(cbBase.value), parseInt(cbTarget.value));
+}
+cbBase.addEventListener("change", runCompare);
+cbTarget.addEventListener("change", runCompare);
+document.getElementById("cb-exit").addEventListener("click", exitCompare);
+document.getElementById("history").addEventListener("click", () => {
+  const bar = document.getElementById("comparebar");
+  const on = !bar.classList.contains("show");
+  bar.classList.toggle("show", on);
+  document.getElementById("history").setAttribute("aria-pressed", String(on));
+  if (on) runCompare(); else exitCompare();
+});
+
+// ---- run ----
+function resize() { const b = svg.getBoundingClientRect(); W = b.width || 800; H = b.height || 600; }
+function relax(n) { for (let i=0;i<n;i++) tick(); draw(); }
+resize(); seed(); relax(400); applyFilter();
+let settle = 0, raf;
+(function anneal(){ if (settle++ > 90) return; tick(); draw(); raf = requestAnimationFrame(anneal); })();
+if (matchMedia("(prefers-reduced-motion: reduce)").matches) { cancelAnimationFrame(raf); relax(90); }
+let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { resize(); relax(200); }, 120); });
+</script>
