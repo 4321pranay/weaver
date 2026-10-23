@@ -124,6 +124,46 @@ go test -v ./internal/bench           # benchmark scores; a miss prints the full
   run) does weaver fall back to names: real constants only, test code skipped,
   the service's own first, and a name with different values left unresolved.
 
+## Pending
+
+Known gaps, roughly in priority order.
+
+**Accuracy**
+- **Measure on real code.** All scores so far come from synthetic benchmarks
+  (`benchmarks/`). The next step is hand-labelled ground truth for a few real
+  services, to get real precision/recall.
+- **Unresolved `Class.CONSTANT` references are still guessed.** When neither
+  SCIP nor the name-based fallback resolves one, a naming-convention rule turns
+  it into `constant` (lowercased, `_` → `.`), which can be wrong. It should be
+  marked unresolved instead.
+- **Repos SCIP can't index.** No indexer for .NET (`scip-dotnet` could be added);
+  projects whose build needs an older JDK than `scip-java` runs on need a
+  per-repo JDK setting.
+- **Non-ASCII columns.** SCIP and tree-sitter may count columns differently on
+  lines with non-ASCII text, so exact constant matching can miss there.
+
+**Correctness**
+- **Version ids can collide.** Graph versions are numbered by build time in
+  seconds; two builds of a domain in the same second share one. Number them
+  previous + 1 instead.
+- **`query flow <service>` over-matches.** It also returns edges whose channel
+  merely contains the service name.
+- **A build passes even when most repos fail SCIP.** It should fail above a
+  threshold of failed repos.
+
+**Scale and operations**
+- **Resolved hops aren't stored.** Every query re-reads and re-matches all
+  edges; storing hops at build time keeps queries fast at thousands of repos.
+- **Air-gapped builds need dependency mirrors.** The SCIP indexers build each
+  project and download its dependencies, so an offline build host needs a Go
+  module proxy and a Maven/Gradle mirror.
+
+**Ideas, not started**
+- An interactive `weaver` prompt with built-in completion (works on Windows,
+  needs no shell setup) instead of the zsh script.
+- Per-repo summaries (purpose, entry points) generated at build time, to help a
+  model pick which repo to look at.
+
 ## Credits
 
 Ideas borrowed (re-implemented from their docs; no code copied, repos not vendored):
