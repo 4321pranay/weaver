@@ -75,24 +75,18 @@ func TestResolvedEdgesAndContext(t *testing.T) {
 	if !slices.Equal(edges, want) {
 		t.Errorf("resolved: %+v", edges)
 	}
-	ctx, err := k.Context("why is payment slow?", nil)
+	got, err := k.Context([]string{"payment"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range []string{
-		"Service: payment",
-		"- OUTBOUND: Calls `ledger` via `kafka` on channel `payments.done`",
-		"- INBOUND: Called by `checkout` via `rest` on channel `/v1/charge`",
-	} {
-		if !strings.Contains(ctx, line) {
-			t.Errorf("context missing %q:\n%s", line, ctx)
-		}
+	wantCtx := ServiceContext{Service: "payment",
+		Outbound: []Peer{{"ledger", "kafka", "payments.done"}},
+		Inbound:  []Peer{{"checkout", "rest", "/v1/charge"}}}
+	if len(got) != 1 || got[0].Service != wantCtx.Service || !slices.Equal(got[0].Outbound, wantCtx.Outbound) || !slices.Equal(got[0].Inbound, wantCtx.Inbound) {
+		t.Errorf("context: %+v, want %+v", got, wantCtx)
 	}
-	if other, _ := k.Context("why is payment slow?", map[string]bool{"ledger": true}); !strings.Contains(other, "No relevant architectural services") {
-		t.Errorf("payment is outside the allowed set, got:\n%s", other)
-	}
-	if none, _ := k.Context("hello", nil); !strings.Contains(none, "No relevant architectural services") {
-		t.Errorf("no-match context: %s", none)
+	if _, err := k.Context([]string{"nope"}); err == nil || !strings.Contains(err.Error(), `unknown service "nope"`) {
+		t.Errorf("unknown service: %v", err)
 	}
 }
 
@@ -221,24 +215,5 @@ func TestDefRefsEscapeWildcards(t *testing.T) {
 	}
 	if d, err := k.FindDefinition("TokenValidator#validateToken", 20); err != nil || len(d) != 1 {
 		t.Errorf("plain substring still matches: %v %v", d, err)
-	}
-}
-
-func TestContainsWord(t *testing.T) {
-	for _, c := range []struct {
-		s, w string
-		want bool
-	}{
-		{"why is payment slow", "payment", true},
-		{"why is payments slow", "payment", false},
-		{"is payment-gateway down?", "payment-gateway", true},
-		{"repayment", "payment", false},
-		{"order_service fails", "order_service", true},
-		{"my_order_service", "order_service", false},
-		{"", "x", false},
-	} {
-		if got := containsWord(c.s, c.w); got != c.want {
-			t.Errorf("containsWord(%q, %q) = %v", c.s, c.w, got)
-		}
 	}
 }

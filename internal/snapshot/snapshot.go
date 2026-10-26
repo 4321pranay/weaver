@@ -27,6 +27,7 @@ import (
 
 type Snapshot struct {
 	Version int64               `json:"version"`
+	Run     string              `json:"run,omitempty"` // the build's run id (sources.go RunID)
 	TS      string              `json:"ts"`
 	Commits map[string]string   `json:"commits"` // repo -> short SHA
 	Hashes  map[string]string   `json:"hashes"`  // repo -> source content hash
@@ -41,6 +42,25 @@ type Manifest struct {
 	GitURL      string `json:"gitUrl"`
 	Branch      string `json:"branch"`
 	SHA         string `json:"sha"`
+	Run         string `json:"run,omitempty"`   // the build that used it
+	Root        string `json:"root,omitempty"`  // the service's folder in its repo (a monorepo); "" = the repo
+	Clone       string `json:"clone,omitempty"` // the clone's folder when shared (a monorepo); "" = <service>
+}
+
+// Dir: the service's clone, sourcesDir/<service>, or the monorepo clone its
+// services share. SCIP, call graphs and paths (always relative to it) see the
+// whole repo, so a monorepo's shared code and build roots still resolve.
+func (m Manifest) Dir(sourcesDir string) string {
+	if m.Clone != "" {
+		return filepath.Join(sourcesDir, m.Clone)
+	}
+	return filepath.Join(sourcesDir, m.ServiceName)
+}
+
+// Code: the service's own code, its root folder in the clone ("" = all of it):
+// what its edges, config, release version and source hash come from.
+func (m Manifest) Code(sourcesDir string) string {
+	return filepath.Join(m.Dir(sourcesDir), m.Root)
 }
 
 // ReadManifest reads dir/manifest.json.
@@ -96,14 +116,14 @@ func RepoCommit(repoDir string) string {
 }
 
 // ForDomain snapshots one domain: commits + source hashes of its services
-// (sourcesDir/<service>), and every resolved hop touching one of them — hops are
+// (Manifest.Code), and every resolved hop touching one of them — hops are
 // resolved across ALL domains first, so a call into another domain stays.
 func ForDomain(domain string, manifest []Manifest, sourcesDir string, hops []graph.Hop) Snapshot {
 	s := Snapshot{Commits: map[string]string{}, Hashes: map[string]string{},
 		Domains: map[string][]string{}, Edges: []graph.Hop{}}
 	mine := map[string]bool{}
 	for _, m := range manifest {
-		d := filepath.Join(sourcesDir, m.ServiceName)
+		d := m.Code(sourcesDir)
 		s.Commits[m.ServiceName] = RepoCommit(d)
 		s.Hashes[m.ServiceName] = ServiceHash(d)
 		s.Domains[domain] = append(s.Domains[domain], m.ServiceName)

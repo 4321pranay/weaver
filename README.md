@@ -18,7 +18,7 @@ knowledge/<domain>/           output:
                        repo:^(checkout|payment)$ retry · meta.domain:^payments$ timeout
   manifest.json        service -> git url, branch, commit
   edges.override.yaml  runtime-only edges you add by hand (template on first build)
-  graph.html           service map: open in a browser; compare any two versions
+  graph.html           only with --graph: service map for humans; compare any two versions
   scip/                per-repo SCIP indexes (intermediate)
 ```
 
@@ -70,6 +70,7 @@ weaver build                  # every domain with a sources.yaml (prompts for gi
 weaver build payments         # just one domain; links to other domains come from their existing knowledge
 weaver build --no-fetch       # rebuild from the existing clones, no git
 weaver build --reindex        # SCIP-index every service again (default: reuse unchanged ones)
+weaver build --graph          # also write graph.html, the service map page for humans
 ```
 
 Each service is cloned at its `branch` (required) into `sources/<domain>/<service>`;
@@ -93,7 +94,7 @@ weaver query def validateToken          # where defined, any repo
 weaver query refs validateToken         # who uses it, any repo
 weaver query flow payment               # payment's raw service edges
 weaver query blast payment both 3       # what breaks / what it depends on, by hop
-weaver query context "why is checkout slow?"   # system prompt grounded in the graph
+weaver query context checkout payment   # direct hops of each service, as JSON
 weaver query graph --infra        # service map JSON
 weaver query versions            # graph versions, one per build; then: weaver query diff <v1> <v2>
 weaver query search 'repo:^payment$ retry'   # the Zoekt index, falcon's view

@@ -60,18 +60,27 @@ func TestWrappersScopedByReference(t *testing.T) {
 	ins("lib", "AcmeKafka.java", helper, 1, 20, 20, 24)                       // helper() — no sink inside
 	ins("app", "App.java", pub, 0, 3)
 	ins("other", "Plain.java", "scip x com/other/Plain#publish().", 1, 2, 2, 4)
+	// an injected interface: the impl's file references Bus, Bus defines publish(); callers call Bus#publish()
+	busPub := "scip x com/acme/Bus#publish()."
+	ins("lib", "AcmeKafka.java", "scip x com/acme/Bus#", 0, 1)
+	ins("lib", "Bus.java", busPub, 1, 3, 3, 3)
+	ins("lib", "Bus.java", "scip x com/acme/Bus#close().", 1, 4, 4, 4) // no wrapper behind it
+	ins("svc", "Svc.java", busPub, 0, 7)
 
 	syms, err := WrapperSymbols(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	kafka := extract.Wrapper{Kind: "kafka", Role: "produce"}
-	if len(syms) != 1 || syms[pub] != kafka {
-		t.Fatalf("wrapper symbols: %v (want only publish: helper is in the file but doesn't call the sink)", syms)
+	if len(syms) != 2 || syms[pub] != kafka || syms[busPub] != kafka {
+		t.Fatalf("wrapper symbols: %v (want publish and its interface's: helper is in the file but doesn't call the sink)", syms)
 	}
 	used, err := WrappersUsed(db, syms)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if used["svc"]["publish"] != kafka {
+		t.Errorf("svc calls the wrapper through its interface: %v", used)
 	}
 	if used["app"]["publish"] != kafka {
 		t.Errorf("app references the wrapper: %v", used)

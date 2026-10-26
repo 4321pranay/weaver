@@ -17,7 +17,7 @@ _weaver() {
   local w=${words[1]}
   if (( CURRENT == 2 )); then compadd build use query completion help; return; fi
   case ${words[2]} in
-    build) compadd -- --no-fetch --reindex ${(f)"$($w __complete configured 2>/dev/null)"} ;;
+    build) compadd -- --no-fetch --reindex --graph ${(f)"$($w __complete configured 2>/dev/null)"} ;;
     use)
       if (( CURRENT == 3 )); then compadd domain
       else compadd -- --all ${(f)"$($w __complete domains 2>/dev/null)"}; fi ;;
@@ -26,6 +26,7 @@ _weaver() {
       case ${words[3]} in
         def|refs) (( CURRENT == 4 )) && compadd -- ${(f)"$($w __complete symbols ${words[CURRENT]} 2>/dev/null)"} ;;
         flow)     (( CURRENT == 4 )) && compadd -- ${(f)"$($w __complete services 2>/dev/null)"} ;;
+        context)  compadd -- ${(f)"$($w __complete services 2>/dev/null)"} ;;
         blast)
           case $CURRENT in
             4) compadd -- ${(f)"$($w __complete services 2>/dev/null)"} ;;

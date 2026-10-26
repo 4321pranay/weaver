@@ -1,0 +1,62 @@
+{
+  "boot": "3",
+  "secretPatterns": ["password", "passwd", "secret", "token", "key", "credential", "private"],
+  "renamedProperties": {
+    "spring.redis.": "spring.data.redis.",
+    "spring.elasticsearch.rest.": "spring.elasticsearch.",
+    "spring.data.cassandra.": "spring.cassandra.",
+    "spring.flyway.url": "spring.flyway.url (now needs user/password together)",
+    "management.metrics.export.": "management.<product>.metrics.export.",
+    "spring.mvc.throw-exception-if-no-handler-found": "removed (always on since 3.2)",
+    "server.max-http-header-size": "server.max-http-request-header-size",
+    "spring.kafka.streams.cache-max-size-buffering": "spring.kafka.streams.state-store-cache-max-size"
+  },
+  "entrypoints": [
+    {"annotation": "org.springframework.web.bind.annotation.RequestMapping", "kind": "rest"},
+    {"annotation": "org.springframework.web.bind.annotation.GetMapping", "kind": "rest", "method": "GET"},
+    {"annotation": "org.springframework.web.bind.annotation.PostMapping", "kind": "rest", "method": "POST"},
+    {"annotation": "org.springframework.web.bind.annotation.PutMapping", "kind": "rest", "method": "PUT"},
+    {"annotation": "org.springframework.web.bind.annotation.DeleteMapping", "kind": "rest", "method": "DELETE"},
+    {"annotation": "org.springframework.web.bind.annotation.PatchMapping", "kind": "rest", "method": "PATCH"},
+    {"annotation": "org.springframework.scheduling.annotation.Scheduled", "kind": "schedule", "attrs": ["cron", "fixedRateString", "fixedDelayString"]},
+    {"annotation": "org.springframework.kafka.annotation.KafkaListener", "kind": "kafka", "attrs": ["topics", "topicPattern"]},
+    {"annotation": "org.springframework.amqp.rabbit.annotation.RabbitListener", "kind": "rabbit", "attrs": ["queues"]},
+    {"annotation": "org.springframework.jms.annotation.JmsListener", "kind": "jms", "attrs": ["destination"]},
+    {"annotation": "org.springframework.context.event.EventListener", "kind": "event", "attrs": ["classes"], "paramType": true},
+    {"annotation": "org.springframework.transaction.event.TransactionalEventListener", "kind": "event", "attrs": ["classes"], "paramType": true},
+    {"annotation": "com.xxl.job.core.handler.annotation.XxlJob", "kind": "schedule", "attrs": ["value"], "prefix": "xxl-job:"},
+    {"annotation": "org.apache.rocketmq.spring.annotation.RocketMQMessageListener", "kind": "rocketmq", "attrs": ["topic"], "onClass": true, "method": "onMessage"}
+  ],
+  "stubs": {
+    "spring.datasource.url": "jdbc:h2:mem:probe;DB_CLOSE_DELAY=-1;MODE=MySQL",
+    "spring.datasource.driver-class-name": "org.h2.Driver",
+    "spring.datasource.username": "sa",
+    "spring.datasource.password": "",
+    "spring.sql.init.mode": "never",
+    "spring.jpa.hibernate.ddl-auto": "create-drop",
+    "spring.jpa.database-platform": "org.hibernate.dialect.H2Dialect",
+    "spring.flyway.enabled": "false",
+    "spring.liquibase.enabled": "false",
+    "spring.kafka.bootstrap-servers": "127.0.0.1:9",
+    "spring.kafka.listener.auto-startup": "false",
+    "spring.rabbitmq.listener.simple.auto-startup": "false",
+    "spring.data.redis.host": "127.0.0.1",
+    "spring.data.redis.port": "9",
+    "rocketmq.name-server": "127.0.0.1:9",
+    "spring.cloud.config.enabled": "false",
+    "spring.cloud.discovery.enabled": "false",
+    "spring.cloud.nacos.config.enabled": "false",
+    "spring.cloud.nacos.discovery.enabled": "false",
+    "eureka.client.enabled": "false",
+    "spring.task.scheduling.pool.size": "1",
+    "server.port": "0"
+  },
+  "addressProperties": [
+    "spring.datasource.url", "spring.kafka.bootstrap-servers", "spring.data.redis.host", "spring.data.redis.cluster.nodes",
+    "spring.rabbitmq.host", "spring.data.mongodb.uri", "spring.elasticsearch.uris", "rocketmq.name-server"
+  ],
+  "listenerSwitches": [
+    {"annotation": "org.apache.rocketmq.spring.annotation.RocketMQMessageListener", "property": "rocketmq.consumer.listeners.{consumerGroup}.{topic}", "value": "false"}
+  ],
+  "stubJars": ["com.h2database:h2:2.2.224"]
+}

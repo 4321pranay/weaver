@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"gopkg.in/yaml.v3"
 	"strings"
 )
 
@@ -113,6 +115,79 @@ func loadConfig(repoDir string) map[string]string {
 	return config
 }
 
+// ServiceConfig: the config of the service whose code is root in repoDir: its
+// application.yml / .properties / .env, then the environment: of the Docker
+// Compose service built from that folder, anywhere in the repo (a monorepo
+// keeps compose files outside every service's folder). Environment wins, as it
+// does at runtime.
+func ServiceConfig(repoDir, root string) map[string]string {
+	code := filepath.Clean(filepath.Join(repoDir, root))
+	config := loadConfig(code)
+	walkFiles(repoDir, func(dir, name string) {
+		if !reCompose.MatchString(name) {
+			return
+		}
+		t, err := readText(filepath.Join(dir, name))
+		if err != nil {
+			return
+		}
+		var c struct {
+			Services map[string]struct {
+				Build       yaml.Node `yaml:"build"`
+				Environment yaml.Node `yaml:"environment"`
+			} `yaml:"services"`
+		}
+		if yaml.Unmarshal([]byte(t), &c) != nil {
+			return
+		}
+		for _, svc := range c.Services {
+			ctx := svc.Build.Value // build: <dir>
+			if svc.Build.Kind == yaml.MappingNode {
+				for i := 0; i+1 < len(svc.Build.Content); i += 2 {
+					if svc.Build.Content[i].Value == "context" {
+						ctx = svc.Build.Content[i+1].Value
+					}
+				}
+			}
+			if ctx == "" || filepath.Clean(filepath.Join(dir, ctx)) != code {
+				continue
+			}
+			for k, v := range composeEnv(svc.Environment) {
+				config[k] = v
+			}
+		}
+	})
+	return config
+}
+
+var reCompose = regexp.MustCompile(`^(docker-)?compose[\w.-]*\.ya?ml$`)
+
+// composeEnv: a compose service's environment, as a map or a KEY=value list.
+func composeEnv(n yaml.Node) map[string]string {
+	out := map[string]string{}
+	switch n.Kind {
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			out[n.Content[i].Value] = n.Content[i+1].Value
+		}
+	case yaml.SequenceNode:
+		for _, c := range n.Content {
+			if k, v, ok := strings.Cut(c.Value, "="); ok {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// EnvKeys: the environment variable names Spring binds to a property key
+// (relaxed binding): spring.kafka.bootstrap-servers ->
+// SPRING_KAFKA_BOOTSTRAPSERVERS and the common SPRING_KAFKA_BOOTSTRAP_SERVERS.
+func EnvKeys(key string) []string {
+	up := strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+	return []string{strings.ReplaceAll(up, "-", ""), strings.ReplaceAll(up, "-", "_")}
+}
+
 var srcExt = []string{".go", ".java", ".kt"}
 
 // IsSource reports whether a file name is a source file the extractor reads.
@@ -218,6 +293,7 @@ func lastDot(s string) string { return s[strings.LastIndex(s, ".")+1:] }
 type maps struct {
 	config, vars, lits, consts, getters map[string]string
 	exact                               func(ref string) (string, bool) // SCIP, at the call site
+	host                                *string                         // set to a REST URL's host, if it has one
 }
 
 var reRef = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`)
@@ -280,26 +356,30 @@ func normalizeChannel(kind, channel string, unquoted bool, m maps) string {
 		unquoted = false
 	}
 
+	// SpEL `#{T(Topics).ORDER_PLACED}`: the constant's real value, if known
 	if strings.Contains(channel, "#{T") {
-		if s := reSpelConst.FindStringSubmatch(channel); s != nil {
-			return strings.ReplaceAll(strings.ToLower(s[1]), "_", ".")
+		if c := reSpelConst.FindStringSubmatch(channel); c != nil {
+			if v, ok := m.consts[c[1]]; ok {
+				return v
+			}
+			return "<DYNAMIC_DISPATCH: " + channel + ">"
 		}
 	}
-	if unquoted && reDotted.MatchString(channel) {
-		return strings.ReplaceAll(strings.ToLower(lastDot(channel)), "_", ".")
-	}
+	// an unresolved constant stays unresolved: no value is made up from its name
+	// (edges spec: weaver never guesses)
 	if unquoted && !strings.Contains(channel, "<RUNTIME_PARAMETER") {
 		return "<DYNAMIC_DISPATCH: " + channel + ">"
 	}
 	switch kind {
 	case "rest":
+		if h := reScheme.FindString(channel); h != "" && m.host != nil {
+			*m.host = h[strings.Index(h, "//")+2:]
+		}
 		channel = reScheme.ReplaceAllString(channel, "")
 		channel = reBraces.ReplaceAllString(channel, "{}")
 		if strings.HasSuffix(channel, "/") {
 			channel += "{}"
 		}
-	case "redis":
-		channel = strings.TrimSuffix(channel, "{}") // redis matches by key PREFIX
 	}
 	return channel
 }
@@ -456,3 +536,6 @@ func collectGetterConfigs(repoDir string, config map[string]string) map[string]s
 	}
 	return out
 }
+
+// Config: the repo's merged application.yml / .properties / .env keys.
+func Config(repoDir string) map[string]string { return loadConfig(repoDir) }

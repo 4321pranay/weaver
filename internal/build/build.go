@@ -6,31 +6,57 @@
 package build
 
 import (
+	"crypto/sha1"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"weaver/internal/edgemap"
 	"weaver/internal/extract"
+	"weaver/internal/facts"
 	"weaver/internal/graph"
 	"weaver/internal/scip"
 	"weaver/internal/search"
 	"weaver/internal/snapshot"
 	"weaver/internal/ui"
+	"weaver/internal/weaveai"
 )
 
-// Service is one entry under `services:` in a sources.yaml; all fields required.
+// Service is one entry under `services:` in a sources.yaml. Root, optional, is
+// the service's folder in its repo: a monorepo is listed once per service, each
+// entry with the same gitUrl and its own root.
 type Service struct {
-	Domain, ServiceName, GitURL, Branch string
+	Domain, ServiceName, GitURL, Branch, Root string
+}
+
+// Clone: the folder under sources/<domain> the service's repo is cloned into.
+// A service without root has its own, named after it; services with a root
+// share one clone per gitUrl + branch (.repo-<name>-<hash>), so a monorepo is
+// cloned, indexed and captured once, not once per service.
+func (s Service) Clone() string {
+	if s.Root == "" {
+		return s.ServiceName
+	}
+	name := strings.TrimSuffix(s.GitURL[strings.LastIndexAny(s.GitURL, "/:")+1:], ".git")
+	if !safeName.MatchString(name) {
+		name = "repo"
+	}
+	h := sha1.Sum([]byte(s.GitURL + "\x00" + s.Branch))
+	return fmt.Sprintf(".repo-%s-%x", name, h[:4])
 }
 
 // LoadSources reads one domain's sources/<domain>/sources.yaml; the folder
@@ -40,6 +66,7 @@ type Service struct {
 //	  - serviceName: payment-gateway
 //	    gitUrl: https://bitbucket.internal/scm/pay/payment-gateway.git
 //	    branch: release/2.4
+//	    root: services/gateway   # optional: the service's folder in a monorepo
 func LoadSources(path, domain string) ([]Service, error) {
 	if !safeName.MatchString(domain) || domain == "." || domain == ".." {
 		return nil, fmt.Errorf("domain %q: use letters, digits, '.', '_' or '-' (it is a folder name)", domain)
@@ -53,6 +80,7 @@ func LoadSources(path, domain string) ([]Service, error) {
 			ServiceName string `yaml:"serviceName"`
 			GitURL      string `yaml:"gitUrl"`
 			Branch      string `yaml:"branch"`
+			Root        string `yaml:"root"`
 		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
@@ -76,8 +104,15 @@ func LoadSources(path, domain string) ([]Service, error) {
 		if seen[s.ServiceName] {
 			return nil, fmt.Errorf("%s: serviceName %s listed twice", path, s.ServiceName)
 		}
+		root := filepath.ToSlash(filepath.Clean(strings.TrimSpace(s.Root)))
+		if root == "." {
+			root = ""
+		}
+		if filepath.IsAbs(root) || root == ".." || strings.HasPrefix(root, "../") {
+			return nil, fmt.Errorf("%s: %s: root %q must be a folder inside the repo", path, s.ServiceName, s.Root)
+		}
 		seen[s.ServiceName] = true
-		out = append(out, Service{domain, s.ServiceName, s.GitURL, strings.TrimPrefix(s.Branch, "refs/heads/")})
+		out = append(out, Service{domain, s.ServiceName, s.GitURL, strings.TrimPrefix(s.Branch, "refs/heads/"), root})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s: no services under `services:`", path)
@@ -108,7 +143,7 @@ func (g git) run(args ...string) (string, error) {
 }
 
 // Sync clones each service fresh (depth 1) at its configured branch into
-// sourcesDir/<serviceName> and drops clones of services no longer configured. A
+// sourcesDir/<Service.Clone> and drops clones of services no longer configured. A
 // service whose branch doesn't exist, or whose clone fails, is logged and skipped.
 func Sync(services []Service, sourcesDir, user, password string, log io.Writer) ([]snapshot.Manifest, error) {
 	if err := os.MkdirAll(sourcesDir, 0o755); err != nil {
@@ -128,9 +163,16 @@ func Sync(services []Service, sourcesDir, user, password string, log io.Writer) 
 
 	done := []snapshot.Manifest{}
 	configured := map[string]bool{}
+	cloned := map[string]snapshot.Manifest{} // a shared clone, fetched once per build
 	for _, s := range services {
-		configured[s.ServiceName] = true
-		m, err := cloneBranch(g, s, sourcesDir)
+		configured[s.Clone()] = true
+		var m snapshot.Manifest
+		var err error
+		if c, ok := cloned[s.Clone()]; ok {
+			m, err = sharedClone(c, s, sourcesDir)
+		} else if m, err = cloneBranch(g, s, sourcesDir); err == nil {
+			cloned[s.Clone()] = m
+		}
 		if err != nil {
 			// a failed fetch never costs the last good copy: build from it, loudly
 			if prev := Scan([]Service{s}, sourcesDir, io.Discard); len(prev) == 1 {
@@ -147,7 +189,7 @@ func Sync(services []Service, sourcesDir, user, password string, log io.Writer) 
 	// prune only services REMOVED from sources.yaml, never ones that failed
 	ents, _ := os.ReadDir(sourcesDir)
 	for _, e := range ents {
-		if e.IsDir() && !configured[e.Name()] && !strings.HasPrefix(e.Name(), ".") {
+		if e.IsDir() && !configured[e.Name()] && (!strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), ".repo-")) {
 			_ = os.RemoveAll(filepath.Join(sourcesDir, e.Name()))
 		}
 	}
@@ -167,8 +209,8 @@ func cloneBranch(g git, s Service, sourcesDir string) (snapshot.Manifest, error)
 		return snapshot.Manifest{}, fmt.Errorf("branch %s not found, skipped", s.Branch)
 	}
 	branch := s.Branch
-	dest := filepath.Join(sourcesDir, s.ServiceName)
-	tmp := filepath.Join(sourcesDir, ".clone-"+s.ServiceName)
+	dest := filepath.Join(sourcesDir, s.Clone())
+	tmp := filepath.Join(sourcesDir, ".clone-"+strings.TrimPrefix(s.Clone(), "."))
 	_ = os.RemoveAll(tmp)
 	if _, err := g.run("clone", "--quiet", "--depth", "1", "--branch", branch, "--", s.GitURL, tmp); err != nil {
 		_ = os.RemoveAll(tmp)
@@ -179,6 +221,10 @@ func cloneBranch(g git, s Service, sourcesDir string) (snapshot.Manifest, error)
 		_ = os.RemoveAll(tmp)
 		return snapshot.Manifest{}, err
 	}
+	if st, err := os.Stat(filepath.Join(tmp, s.Root)); s.Root != "" && (err != nil || !st.IsDir()) {
+		_ = os.RemoveAll(tmp)
+		return snapshot.Manifest{}, fmt.Errorf("root %s not in the repo at %s, skipped", s.Root, branch)
+	}
 	if err := os.RemoveAll(dest); err != nil {
 		return snapshot.Manifest{}, err
 	}
@@ -186,7 +232,24 @@ func cloneBranch(g git, s Service, sourcesDir string) (snapshot.Manifest, error)
 		return snapshot.Manifest{}, err
 	}
 	return snapshot.Manifest{Domain: s.Domain, ServiceName: s.ServiceName, GitURL: s.GitURL,
-		Branch: branch, SHA: strings.TrimSpace(sha)}, nil
+		Branch: branch, SHA: strings.TrimSpace(sha), Root: s.Root, Clone: clonedAs(s)}, nil
+}
+
+// sharedClone: another service of a clone fetched earlier in this build.
+func sharedClone(c snapshot.Manifest, s Service, sourcesDir string) (snapshot.Manifest, error) {
+	if st, err := os.Stat(filepath.Join(sourcesDir, s.Clone(), s.Root)); err != nil || !st.IsDir() {
+		return snapshot.Manifest{}, fmt.Errorf("root %s not in the repo at %s, skipped", s.Root, c.Branch)
+	}
+	return snapshot.Manifest{Domain: s.Domain, ServiceName: s.ServiceName, GitURL: s.GitURL,
+		Branch: c.Branch, SHA: c.SHA, Root: s.Root, Clone: clonedAs(s)}, nil
+}
+
+// clonedAs: Manifest.Clone, "" when the clone is the service's own folder.
+func clonedAs(s Service) string {
+	if c := s.Clone(); c != s.ServiceName {
+		return c
+	}
+	return ""
 }
 
 // Scan reads what is actually in sourcesDir for each configured service — the
@@ -198,12 +261,16 @@ func Scan(services []Service, sourcesDir string, log io.Writer) []snapshot.Manif
 	g := git{os.Environ()}
 	out := []snapshot.Manifest{}
 	for _, s := range services {
-		dir := filepath.Join(sourcesDir, s.ServiceName)
+		dir := filepath.Join(sourcesDir, s.Clone())
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 			fmt.Fprintf(log, "  !! %s: not in %s, skipped\n", s.ServiceName, sourcesDir)
 			continue
 		}
-		m := snapshot.Manifest{Domain: s.Domain, ServiceName: s.ServiceName, GitURL: s.GitURL, Branch: s.Branch, SHA: "nogit"}
+		if st, err := os.Stat(filepath.Join(dir, s.Root)); s.Root != "" && (err != nil || !st.IsDir()) {
+			fmt.Fprintf(log, "  !! %s: root %s not in %s, skipped\n", s.ServiceName, s.Root, dir)
+			continue
+		}
+		m := snapshot.Manifest{Domain: s.Domain, ServiceName: s.ServiceName, GitURL: s.GitURL, Branch: s.Branch, SHA: "nogit", Root: s.Root, Clone: clonedAs(s)}
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			if b, err := g.run("-C", dir, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
 				if b = strings.TrimSpace(b); b != s.Branch {
@@ -224,13 +291,13 @@ func Scan(services []Service, sourcesDir string, log io.Writer) []snapshot.Manif
 // LoadDomains replaces the domains table in kb.
 func LoadDomains(kb *sql.DB, manifest []snapshot.Manifest) error {
 	for _, q := range []string{"DROP TABLE IF EXISTS domains",
-		"CREATE TABLE domains (domain TEXT, service TEXT, git_url TEXT, branch TEXT, sha TEXT)"} {
+		"CREATE TABLE domains (domain TEXT, service TEXT, git_url TEXT, branch TEXT, sha TEXT, run TEXT)"} {
 		if _, err := kb.Exec(q); err != nil {
 			return err
 		}
 	}
 	for _, m := range manifest {
-		if _, err := kb.Exec("INSERT INTO domains VALUES (?,?,?,?,?)", m.Domain, m.ServiceName, m.GitURL, m.Branch, m.SHA); err != nil {
+		if _, err := kb.Exec("INSERT INTO domains VALUES (?,?,?,?,?,?)", m.Domain, m.ServiceName, m.GitURL, m.Branch, m.SHA, m.Run); err != nil {
 			return err
 		}
 	}
@@ -247,7 +314,7 @@ func LoadDomains(kb *sql.DB, manifest []snapshot.Manifest) error {
 //	<root>/<domain>/manifest.json        service -> git url, branch, sha
 //	<root>/<domain>/versions.jsonl       graph versions (falcon's drift input)
 //	<root>/<domain>/edges.override.yaml  hand-listed runtime-only edges (yours to edit)
-//	<root>/<domain>/graph.html           service map page (open in a browser)
+//	<root>/<domain>/graph.html           service map page (only with Options.Graph)
 //	<root>/<domain>/scip/                per-repo .scip / .db (intermediate)
 type Layout struct{ Root, SourcesRoot string }
 
@@ -272,26 +339,42 @@ func (l Layout) Zoekt(d string) string { return filepath.Join(l.Root, d, "zoekt"
 func (l Layout) Versions(d string) string {
 	return filepath.Join(l.Root, d, "versions.jsonl")
 }
-func (l Layout) Graph(d string) string { return filepath.Join(l.Root, d, "graph.html") }
+
+// A build writes its map, history, releases and page into a new generation,
+// knowledge/<domain>/generations/<n>/, and switches knowledge/<domain>/current
+// to it at the end (weaver-architecture §2). Readers go through current; a
+// domain built before generations reads its old top-level files.
+func (l Layout) Generations(d string) string { return filepath.Join(l.Root, d, "generations") }
+func (l Layout) Gen(d string, n int) string {
+	return filepath.Join(l.Generations(d), strconv.Itoa(n))
+}
+func (l Layout) Current(d string) string { return filepath.Join(l.Root, d, "current") }
+
+// read: name in the current generation, or the domain folder before generations.
+func (l Layout) read(d, name string) string {
+	if _, err := os.Stat(filepath.Join(l.Current(d), name)); err == nil {
+		return filepath.Join(l.Current(d), name)
+	}
+	return filepath.Join(l.Root, d, name)
+}
+func (l Layout) Graph(d string) string     { return l.read(d, "graph.html") }
+func (l Layout) EdgeMap(d string) string   { return l.read(d, "edges.yaml") }
+func (l Layout) Releases(d string) string  { return l.read(d, "releases.yaml") }
+func (l Layout) Questions(d string) string { return filepath.Join(l.Root, d, "questions.yaml") }
+func (l Layout) History(d string) string   { return l.read(d, "edges.history") }
+
+// BuildID: the build id of the domain's current generation, 0 before any.
+func (l Layout) BuildID(d string) int {
+	t, err := os.Readlink(l.Current(d))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(filepath.Base(t))
+	return n
+}
 func (l Layout) Overrides(d string) string {
 	return filepath.Join(l.Root, d, "edges.override.yaml")
 }
-
-// overrideTemplate is written once per domain, so the file is where people look.
-const overrideTemplate = `# Service edges of this domain that static analysis can't see: runtime-computed
-# topics, URLs built from config, dynamic routing. Loaded on every weaver build
-# and merged with the extracted edges. Each row names one of THIS domain's
-# services: src for role: produce, dst for role: consume. Pair a produce row
-# with a consume row (in any domain) on the same kind + channel to make a hop.
-#
-# role: produce | consume        kind: rest | grpc | kafka | redis | db
-#
-# - src: checkout
-#   dst: ""
-#   kind: kafka
-#   channel: orders.created
-#   role: produce
-`
 
 // Domains lists the built domains (folders holding a manifest.json), sorted.
 func (l Layout) Domains() []string {
@@ -309,7 +392,11 @@ type Options struct {
 	User, Password string        // git credentials when Fetch
 	ScipTimeout    time.Duration // per build root; 0 = no limit
 	Reindex        bool          // ignore the SCIP cache: index every build root again
+	Graph          bool          // also render graph.html (a page for humans; nothing reads it)
 	Log            io.Writer
+	// Tools: weaver's read-only tools over a build in progress (its kb.db,
+	// Zoekt and releases), for weave-ai. nil = weave-ai off.
+	Tools func(domain, kbPath, zoektDir string, releases map[string]string) weaveai.Tools
 }
 
 // Run builds the knowledge of the domains the services belong to. Each domain's
@@ -355,9 +442,14 @@ func Run(services []Service, l Layout, o Options) error {
 			return err
 		}
 		if _, err := os.Stat(l.Overrides(d)); os.IsNotExist(err) {
-			if err := os.WriteFile(l.Overrides(d), []byte(overrideTemplate), 0o644); err != nil {
+			if err := os.WriteFile(l.Overrides(d), []byte(edgemap.OverrideTemplate), 0o644); err != nil {
 				return err
 			}
+		}
+		// the run id: what this build of the domain built (git URL + commit per service)
+		run := edgemap.RunID(m)
+		for i := range m {
+			m[i].Run = run
 		}
 		manifests[d] = m // written only once the domain's kb.db is in place (step 4)
 	}
@@ -411,6 +503,27 @@ func Run(services []Service, l Layout, o Options) error {
 			domainOf[m.ServiceName] = d
 		}
 	}
+	// cloneDir: a service's clone, what SCIP paths are relative to; codeDir: its
+	// own code, its root folder in a monorepo (Manifest.Dir / Code). A service
+	// of another domain, not in this run, is sources/<domain>/<service>.
+	codes, clones, roots := map[string]string{}, map[string]string{}, map[string]string{}
+	for _, d := range domains {
+		for _, m := range manifests[d] {
+			codes[m.ServiceName], clones[m.ServiceName], roots[m.ServiceName] = m.Code(l.Sources(d)), m.Dir(l.Sources(d)), m.Root
+		}
+	}
+	cloneDir := func(svc string) string {
+		if dir, ok := clones[svc]; ok {
+			return dir
+		}
+		return filepath.Join(l.Sources(domainOf[svc]), svc)
+	}
+	codeDir := func(svc string) string {
+		if dir, ok := codes[svc]; ok {
+			return dir
+		}
+		return cloneDir(svc)
+	}
 	var all []extract.Edge
 	var readKBs []*sql.DB
 	for _, d := range others {
@@ -451,41 +564,205 @@ func Run(services []Service, l Layout, o Options) error {
 	for _, d := range domains {
 		allKBs = append(allKBs, kbs[d])
 	}
-	symbols, err := scip.NewConstValues(allKBs, func(repo string) string {
-		return filepath.Join(l.Sources(domainOf[repo]), repo)
-	})
+	symbols, err := scip.NewConstValues(allKBs, cloneDir)
 	if err != nil {
 		return err
 	}
-	x := &extract.Extractor{Wrappers: used, Consts: &consts, Symbols: symbols}
+	// calls from SCIP: what each call site resolves to decides, never its method
+	// name (user.set(...) is no Redis write); client types answered with
+	// `weaver answer` count too, and unknown ones become `client` questions
+	answeredClients := map[string]string{}
+	for _, d := range domains {
+		qf, err := edgemap.LoadQuestions(l.Questions(d))
+		if err != nil {
+			return err
+		}
+		for t, k := range qf.ClientAnswers() {
+			answeredClients[t] = k
+		}
+	}
+	owns := func(svc, path string) bool { // a monorepo service owns only its root's files
+		r := roots[svc]
+		return r == "" || strings.HasPrefix(path, r+"/")
+	}
+	calls := map[string]map[extract.Site]map[string][]extract.Hit{}
+	unknown := map[string]map[string]*scip.UnknownClient{}
+	for _, db := range allKBs {
+		c, u, err := scip.ClientCalls(db, cloneDir, owns, wrappers, answeredClients)
+		if err != nil {
+			return err
+		}
+		for repo, lines := range c {
+			calls[repo] = lines
+		}
+		for repo, us := range u {
+			unknown[repo] = us
+		}
+	}
+	x := &extract.Extractor{Wrappers: used, Consts: &consts, Symbols: symbols, Calls: calls}
 
 	// 4. service edges per domain, plus each domain's own edges.override.yaml
 	raw := map[string][]extract.Edge{}
 	for _, d := range domains {
 		for _, m := range manifests[d] {
-			e := x.ExtractRepo(filepath.Join(l.Sources(d), m.ServiceName))
+			e := x.ExtractService(m.Dir(l.Sources(d)), m.ServiceName, m.Root)
 			raw[d] = append(raw[d], e...)
 			all = append(all, e...)
 		}
 	}
+	// each domain's edges.override.yaml, validated before anything is written
+	overrides := map[string]*edgemap.Override{}
+	extracted := all // the service map takes extracted rows only; overrides merge in by its own rules
 	for _, d := range domains {
-		overrides, err := extract.LoadOverrides(l.Overrides(d))
+		o, err := edgemap.LoadOverride(l.Overrides(d))
 		if err != nil {
 			return err // nothing written yet: the previous knowledge stays
 		}
-		for _, e := range overrides {
-			svc := e.Src
-			if e.Role == "consume" {
-				svc = e.Dst
-			}
-			if domainOf[svc] != d {
-				fmt.Fprintf(log, "  !! %s override %s %s: service %q is not in domain %s, skipped\n", d, e.Kind, e.Channel, svc, d)
-				continue
-			}
-			e.Repo = svc
-			raw[d] = append(raw[d], e)
-			all = append(all, e)
+		overrides[d] = o
+		for _, sk := range o.Skipped {
+			fmt.Fprintf(log, "  !! override row skipped: %s\n", sk)
 		}
+		for _, e := range o.Rows(domainOf) { // kb.db service_edges and versions still read rows
+			if domainOf[e.Repo] == d {
+				raw[d] = append(raw[d], e)
+			}
+			all = append(all, e) // hops resolve over every domain
+		}
+	}
+	// code search per domain, before the map: weave-ai reads this build's code
+	// text while it reviews the map. A release's name is its build-file version.
+	relNames := map[string]map[string]string{}
+	for _, d := range domains {
+		relNames[d] = map[string]string{}
+		for _, m := range manifests[d] {
+			name := edgemap.ReleaseVersion(m.Code(l.Sources(d)))
+			if name == "" {
+				name = m.SHA[:min(12, len(m.SHA))]
+			}
+			relNames[d][m.ServiceName] = name
+		}
+		if err := zoektIndex(l, d, manifests[d], relNames[d], log); err != nil {
+			return err
+		}
+	}
+
+	// the service map (docs/edges-spec.md), while every kb is still open; each
+	// domain's outputs go into a new generation, switched to at the very end
+	gens := map[string]int{}
+	for _, d := range domains {
+		runID := manifests[d][0].Run
+		qf, err := edgemap.LoadQuestions(l.Questions(d))
+		if err != nil {
+			return err
+		}
+		// a new generation, starting from the current one's cumulative parts
+		build := l.BuildID(d) + 1
+		gdir := l.Gen(d, build)
+		if err := newGeneration(l, d, gdir); err != nil {
+			return err
+		}
+		gens[d] = build
+
+		// the analyzers' output, per service, as facts (docs/analyzer-spec.md):
+		// written into the generation and read back, so the edge mapper takes
+		// only what the facts say
+		cg := callGraphs(l, d, manifests[d], log)
+		gapsOf := map[string][]edgemap.Question{}
+		probeQs, probeEntries := springProbe(l, d, manifests[d], qf, log)
+		for _, q := range append(probeQs, clientQuestions(manifests[d], unknown)...) {
+			svc := q.Subject["service"]
+			if svc == "" && len(q.Sites) > 0 {
+				svc, _, _ = strings.Cut(q.Sites[0], ":")
+			}
+			gapsOf[svc] = append(gapsOf[svc], q)
+		}
+		mine := map[string]bool{}
+		rowsOf := map[string][]extract.Edge{}
+		for _, m := range manifests[d] {
+			mine[m.ServiceName] = true
+		}
+		var rows []extract.Edge // other domains' rows: read-only context, not facts of this build
+		for _, e := range extracted {
+			if mine[e.Repo] {
+				rowsOf[e.Repo] = append(rowsOf[e.Repo], e)
+			} else {
+				rows = append(rows, e)
+			}
+		}
+		fdir := filepath.Join(gdir, "facts")
+		cfgOf := map[string]map[string]string{}
+		var qs []edgemap.Question
+		callGraph := map[string][]edgemap.CGEdge{}
+		for _, m := range manifests[d] {
+			cfg := extract.ServiceConfig(cloneDir(m.ServiceName), roots[m.ServiceName])
+			f := toFacts(m, analyzerName(cloneDir(m.ServiceName), m.Root), rowsOf[m.ServiceName], cg[m.ServiceName], cfg, gapsOf[m.ServiceName])
+			f.Entrypoints = addEntries(f.Entrypoints, probeEntries[m.ServiceName])
+			if err := facts.Write(fdir, f); err != nil {
+				return err
+			}
+			back, err := facts.Read(fdir, m.ServiceName)
+			if err != nil {
+				return err
+			}
+			r, c, g := fromFacts(back)
+			rows = append(rows, r...)
+			if len(c) > 0 {
+				callGraph[m.ServiceName] = c
+			}
+			cfgOf[m.ServiceName] = back.ConfigMap()
+			qs = append(qs, g...)
+		}
+		config := func(svc string) map[string]string {
+			if c, ok := cfgOf[svc]; ok {
+				return c
+			}
+			return extract.ServiceConfig(cloneDir(svc), roots[svc]) // another domain's service
+		}
+		m, mqs, warns, err := edgemap.Build(edgemap.Input{Domain: d, DomainOf: domainOf, Raw: rows, KBs: allKBs, Override: overrides[d], Answers: qf.Answers(),
+			CallGraph: callGraph, Config: config})
+		if err != nil {
+			return fmt.Errorf("domain %s: %w", d, err)
+		}
+		qs = append(mqs, qs...)
+		for _, w := range warns {
+			fmt.Fprintf(log, "  !! %s\n", w)
+		}
+		m.Run = runID
+		// weave-ai reviews every edge against the code before it is written
+		if c, on := weaveai.FromEnv(); on && o.Tools != nil {
+			r := &weaveai.Reviewer{C: c, Tools: o.Tools(d, l.KB(d)+".tmp", l.Zoekt(d), relNames[d]),
+				Cache: filepath.Join(l.Domain(d), "weave-ai", "verdicts.yaml")}
+			qs = append(qs, reviewMap(&m, r, d, qf, log)...)
+		}
+		if err := edgemap.Write(filepath.Join(gdir, "edges.yaml"), m); err != nil {
+			return err
+		}
+		// releases and per-service edge history, describing the edges.yaml just written
+		notes, err := edgemap.Record(filepath.Join(gdir, "releases.yaml"), filepath.Join(gdir, "edges.history"), manifests[d],
+			codeDir, m, time.Now())
+		if err != nil {
+			return err
+		}
+		if len(notes) > 0 {
+			fmt.Fprintf(log, "  .. %s releases: %d note(s), e.g. %s\n", d, len(notes), notes[0])
+		}
+		if o.Graph { // the page draws edges.yaml, nothing else
+			if err := ui.Write(filepath.Join(gdir, "graph.html"), d, m); err != nil {
+				return err
+			}
+			fmt.Fprintf(log, ">> %s: service map -> %s\n", d, filepath.Join(gdir, "graph.html"))
+		}
+		run := qf.Record(runID, build, time.Now(), len(manifests[d]), qs)
+		if err := qf.Write(l.Questions(d)); err != nil {
+			return err
+		}
+		fmt.Fprintf(log, ">> %s: build %d: %d nodes, %d edges -> %s\n", d, build, len(m.Nodes), len(m.Edges), filepath.Join(gdir, "edges.yaml"))
+		for _, svc := range sortedKeys(m.EntryStats) {
+			st := m.EntryStats[svc]
+			fmt.Fprintf(log, "   entries %-32s found %4d  none %4d  unknown %4d\n", svc, st[0], st[1], st[2])
+		}
+		fmt.Fprintf(log, ">> %s: %s raised %d questions (%d new, %d resolved, %d obsolete), %d call sites waiting on an answer -> %s\n",
+			d, runID, run.Raised, run.New, run.Resolved, run.Obsolete, run.Pending, l.Questions(d))
 	}
 	for _, d := range domains {
 		if err := extract.WriteEdges(kbs[d], raw[d]); err != nil {
@@ -513,27 +790,88 @@ func Run(services []Service, l Layout, o Options) error {
 	hops := graph.ResolveWithProvenance(all)
 	for _, d := range domains {
 		s := snapshot.ForDomain(d, manifests[d], l.Sources(d), hops)
+		s.Run = manifests[d][0].Run
 		if err := snapshot.Append(l.Versions(d), s); err != nil {
 			return err
 		}
-		all, err := snapshot.LoadAll(l.Versions(d))
-		if err != nil {
-			return err
-		}
-		if err := ui.Write(l.Graph(d), d, all, domainOf); err != nil {
-			return err
-		}
-		fmt.Fprintf(log, ">> %s: version %d, %d edges -> %s, %s\n", d, s.Version, len(s.Edges), l.Versions(d), l.Graph(d))
+		fmt.Fprintf(log, ">> %s: version %d, %d edges -> %s\n", d, s.Version, len(s.Edges), l.Versions(d))
 	}
 
-	// 6. code search per domain
+	// 7. switch every domain to its new generation, all outputs being written
 	for _, d := range domains {
-		if err := zoektIndex(l, d, manifests[d], log); err != nil {
-			return err
+		if n, ok := gens[d]; ok {
+			if err := switchGeneration(l, d, n, manifests[d][0].Run); err != nil {
+				return err
+			}
+			fmt.Fprintf(log, ">> %s: build %d is current -> %s\n", d, n, l.Current(d))
 		}
 	}
 	fmt.Fprintf(log, ">> %d wrapper methods found, used by %d services\n", len(wrappers), len(used))
 	return nil
+}
+
+// newGeneration makes the folder of a new build: the current generation's
+// cumulative parts (edge history, releases.yaml) carried forward, and the
+// override as it is now, which this build's map was merged with.
+func newGeneration(l Layout, d, gdir string) error {
+	if err := os.RemoveAll(gdir); err != nil { // a failed build's leftovers
+		return err
+	}
+	if err := os.MkdirAll(gdir, 0o755); err != nil {
+		return err
+	}
+	if err := copyTree(l.History(d), filepath.Join(gdir, "edges.history")); err != nil {
+		return err
+	}
+	for _, f := range [][2]string{{l.Releases(d), "releases.yaml"}, {l.Overrides(d), "edges.override.yaml"}} {
+		if b, err := os.ReadFile(f[0]); err == nil {
+			if err := os.WriteFile(filepath.Join(gdir, f[1]), b, 0o644); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// switchGeneration records the build id and points current at it in one
+// rename, so a reader sees the old generation or the new one, never a mix.
+// Every generation is kept.
+func switchGeneration(l Layout, d string, n int, run string) error {
+	gdir := l.Gen(d, n)
+	meta := fmt.Sprintf("build: %d\nrun: %s\nbuiltAt: %q\n", n, run, time.Now().UTC().Format(time.RFC3339))
+	if err := os.WriteFile(filepath.Join(gdir, "build.yaml"), []byte(meta), 0o644); err != nil {
+		return err
+	}
+	tmp := l.Current(d) + ".new"
+	_ = os.Remove(tmp)
+	if err := os.Symlink(filepath.Join("generations", strconv.Itoa(n)), tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, l.Current(d))
+}
+
+// copyTree copies a folder of files (edge history: <svc>/<version>.yaml).
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, e os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) && p == src {
+				return nil
+			}
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		out := filepath.Join(dst, rel)
+		if e.IsDir() {
+			return os.MkdirAll(out, 0o755)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(out, b, 0o644)
+	})
 }
 
 // lock takes the knowledge folder for this build: two builds would each delete
@@ -625,6 +963,14 @@ func reusable(c scipCache, m snapshot.Manifest, repo string, roots []scip.Root) 
 	return err == nil && strings.TrimSpace(string(out)) == ""
 }
 
+// ps0: the service a shared index was built for.
+func ps0(ps []scip.Part) string {
+	if len(ps) == 0 {
+		return "its clone (none built)"
+	}
+	return ps[0].Repo
+}
+
 func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.Writer) (*sql.DB, error) {
 	if err := os.MkdirAll(l.Scip(d), 0o755); err != nil {
 		return nil, err
@@ -633,8 +979,20 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 	_ = os.Remove(tmpKB)
 	var parts []scip.Part
 	indexed, reused := 0, 0
+	shared := map[string][]scip.Part{} // clone dir -> its indexes, for the other services of a monorepo
 	for _, m := range manifest {
-		name, repo := m.ServiceName, filepath.Join(l.Sources(d), m.ServiceName)
+		name, repo := m.ServiceName, m.Dir(l.Sources(d))
+		if ps, ok := shared[repo]; ok {
+			for _, p := range ps {
+				parts = append(parts, scip.Part{Scip: p.Scip, Repo: name, Prefix: p.Prefix, Release: m.SHA})
+			}
+			if len(ps) > 0 {
+				indexed++
+			}
+			fmt.Fprintf(log, "  %s: shares the SCIP index of %s\n", name, ps0(ps))
+			continue
+		}
+		first := len(parts)
 		roots := scip.Roots(repo)
 		if len(roots) == 0 {
 			fmt.Fprintf(log, "  %s: SCIP skipped: no Maven/Gradle project or go.mod\n", name)
@@ -656,7 +1014,7 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 			if reuse {
 				if _, err := os.Stat(sc); prev.OK[i] && err == nil {
 					cache.OK[i] = true
-					parts = append(parts, scip.Part{Scip: sc, Repo: name, Prefix: r.Dir})
+					parts = append(parts, scip.Part{Scip: sc, Repo: name, Prefix: r.Dir, Release: m.SHA})
 					ok++
 					continue
 				}
@@ -674,7 +1032,7 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 			}
 			fmt.Fprintf(log, "  %s: indexed in %s\n", where, time.Since(start).Round(time.Second))
 			cache.OK[i] = true
-			parts = append(parts, scip.Part{Scip: sc, Repo: name, Prefix: r.Dir})
+			parts = append(parts, scip.Part{Scip: sc, Repo: name, Prefix: r.Dir, Release: m.SHA})
 			ok++
 		}
 		if reuse {
@@ -689,6 +1047,9 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 		if ok > 0 {
 			indexed++
 		}
+		if m.Clone != "" {
+			shared[repo] = append([]scip.Part(nil), parts[first:]...)
+		}
 		if len(roots) > 1 {
 			fmt.Fprintf(log, "  %s: %d/%d build roots SCIP-indexed\n", name, ok, len(roots))
 		}
@@ -698,6 +1059,16 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 	}
 	kb, err := sql.Open("sqlite", tmpKB)
 	if err != nil {
+		return nil, err
+	}
+	// every older release of the previous kb.db comes along, not current: old
+	// releases are never indexed again (build-spec §4)
+	built := map[string]string{}
+	for _, m := range manifest {
+		built[m.ServiceName] = m.SHA
+	}
+	if err := scip.CarryForward(kb, l.KB(d), built); err != nil {
+		kb.Close()
 		return nil, err
 	}
 	skipped, err := scip.Ingest(kb, parts)
@@ -714,24 +1085,174 @@ func scipKB(l Layout, d string, manifest []snapshot.Manifest, o Options, log io.
 
 // zoektIndex writes the domain's code-search shards: one repo per service with
 // its release branch, commit and domain; shards of dropped services go.
-func zoektIndex(l Layout, d string, manifest []snapshot.Manifest, log io.Writer) error {
+func zoektIndex(l Layout, d string, manifest []snapshot.Manifest, rels map[string]string, log io.Writer) error {
 	dir := l.Zoekt(d)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	keep := map[string]bool{}
+	n := 0
 	for _, m := range manifest {
-		r := search.Repo{Name: m.ServiceName, Dir: filepath.Join(l.Sources(d), m.ServiceName),
-			URL: m.GitURL, Domain: d, Branch: m.Branch, Commit: m.SHA}
+		r := search.Repo{Name: m.ServiceName, Run: m.Run, Dir: m.Dir(l.Sources(d)), Root: m.Root,
+			URL: m.GitURL, Domain: d, Branch: m.Branch, Commit: m.SHA, Release: rels[m.ServiceName]}
+		if done, _ := filepath.Glob(filepath.Join(dir, url.QueryEscape(search.ShardPrefix(r))+"_v*.zoekt")); len(done) > 0 && m.SHA != "nogit" {
+			continue // this release is indexed already, and a release's code doesn't change
+		}
 		if err := search.IndexRepo(dir, r); err != nil {
 			return fmt.Errorf("zoekt index %s: %w", m.ServiceName, err)
 		}
-		keep[m.ServiceName] = true
+		n++
 	}
-	n, err := search.Prune(dir, keep)
-	if err != nil {
-		return err
+	// shards from before releases had their own (named <service>_v16…, no
+	// release branch) can't be searched by release: they go
+	if old, _ := filepath.Glob(filepath.Join(dir, "*.zoekt")); len(old) > 0 {
+		for _, f := range old {
+			if !strings.Contains(filepath.Base(f), "%40") {
+				_ = os.Remove(f)
+			}
+		}
 	}
-	fmt.Fprintf(log, ">> %s: zoekt index, %d services (%d stale shards removed) -> %s\n", d, len(keep), n, dir)
+	// every release's shard is kept, retired services' included (build-spec §4)
+	fmt.Fprintf(log, ">> %s: zoekt index, %d release(s) indexed, %d services -> %s\n", d, n, len(manifest), dir)
 	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// clientQuestions: one `client` question per external type the domain's
+// services call that looks like a client but isn't classified, with the
+// services and call sites that use it.
+func clientQuestions(ms []snapshot.Manifest, unknown map[string]map[string]*scip.UnknownClient) []edgemap.Question {
+	type agg struct {
+		calls         int
+		svcs, methods []string
+		sites         []string
+	}
+	by := map[string]*agg{}
+	var types []string
+	for _, m := range ms {
+		for typ, u := range unknown[m.ServiceName] {
+			a := by[typ]
+			if a == nil {
+				a = &agg{}
+				by[typ] = a
+				types = append(types, typ)
+			}
+			a.calls += u.Calls
+			a.svcs = append(a.svcs, m.ServiceName)
+			for _, x := range u.Methods {
+				if !slices.Contains(a.methods, x) {
+					a.methods = append(a.methods, x)
+				}
+			}
+			for _, st := range u.Sites {
+				a.sites = append(a.sites, fmt.Sprintf("%s:%s:%d", m.ServiceName, st.Path, st.Line+1))
+			}
+		}
+	}
+	sort.Strings(types)
+	var out []edgemap.Question
+	for _, typ := range types {
+		a := by[typ]
+		sort.Strings(a.methods)
+		out = append(out, edgemap.ClientQuestion(typ, a.calls, a.svcs, a.methods, a.sites))
+	}
+	return out
+}
+
+// ReleaseNames: each service's current release name from a releases.yaml (its
+// version, else its short commit): the branch its Zoekt shard carries.
+func ReleaseNames(path string) map[string]string {
+	out := map[string]string{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	var f edgemap.ReleaseFile
+	if yaml.Unmarshal(b, &f) != nil {
+		return out
+	}
+	for _, s := range f.Services {
+		if len(s.Releases) == 0 {
+			continue
+		}
+		r := s.Releases[0]
+		name := r.Version
+		if name == "" {
+			name = r.CommitHash[:min(12, len(r.CommitHash))]
+		}
+		out[s.ServiceName] = name
+	}
+	return out
+}
+
+// reviewMap has weave-ai check every edge (docs/analyzer-spec.md §5), those
+// with the most entry points behind them first, up to the cap. An edge it
+// agrees with is marked reviewedBy: llm; one it disputes stays in the map with
+// call: unknown and a review question. A review answered keep is the human's.
+func reviewMap(m *edgemap.Map, r *weaveai.Reviewer, d string, qf *edgemap.Questions, log io.Writer) []edgemap.Question {
+	answered := qf.ReviewAnswers()
+	order := make([]int, len(m.Edges))
+	weight := func(e edgemap.Edge) int {
+		n := 0
+		for _, c := range e.Callers {
+			if l, ok := c.Entries.([]edgemap.Entry); ok {
+				n += len(l)
+			}
+		}
+		return n
+	}
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		ea, eb := m.Edges[order[a]], m.Edges[order[b]]
+		if wa, wb := weight(ea), weight(eb); wa != wb {
+			return wa > wb
+		}
+		return edgemap.EdgeRef(ea) < edgemap.EdgeRef(eb)
+	})
+	var qs []edgemap.Question
+	agreed, disputed, reviewed := 0, 0, 0
+	for _, i := range order {
+		e := &m.Edges[i]
+		ref := edgemap.EdgeRef(*e)
+		if answered[ref] == "keep" {
+			e.ReviewedBy = "human"
+			continue
+		}
+		if e.Question != "" || reviewed >= r.C.MaxReviews {
+			continue // waiting on a question already, or over the cap: unreviewed
+		}
+		reviewed++
+		c := weaveai.Claim{Ref: ref, Domain: d}
+		for _, cl := range e.Callers {
+			c.Sites = append(c.Sites, e.From+":"+cl.At)
+		}
+		if e.Handler != nil {
+			c.Handler = e.Handler.At
+		}
+		v, err := r.Review(c)
+		if err != nil {
+			fmt.Fprintf(log, "  !! weave-ai: %v; the rest of the map is written unreviewed\n", err)
+			break
+		}
+		if v.Agree {
+			e.ReviewedBy = "llm"
+			agreed++
+			continue
+		}
+		q := edgemap.ReviewQuestion(*e, v.Reason, v.Evidence)
+		e.Call, e.Question = "unknown", q.ID
+		qs = append(qs, q)
+		disputed++
+	}
+	fmt.Fprintf(log, ">> %s: weave-ai reviewed %d edges: %d agreed, %d disputed, %d unreviewed\n", d, reviewed, agreed, disputed, len(m.Edges)-reviewed)
+	return qs
 }

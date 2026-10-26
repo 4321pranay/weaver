@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {"id": "C1",  "problem": "two impls, @Primary wins",               "inject": "com.example.shop.order.OrderService#<init>(0:gateway)", "impl": "com.example.shop.pay.StripeGateway"},
+    {"id": "C2",  "problem": "@Qualifier on param beats @Primary",      "inject": "com.example.shop.pay.RefundService#<init>(0:gateway)", "impl": "com.example.shop.pay.PaypalGateway"},
+    {"id": "C3",  "problem": "@Resource(name)",                         "inject": "com.example.shop.notify.AlertService#notifier", "impl": "com.example.shop.notify.SmsNotifier"},
+    {"id": "C4",  "problem": "@ConditionalOnProperty picks the impl",   "inject": "com.example.shop.order.OrderService#<init>(1:cache)", "impl": "com.example.shop.cache.LocalCache"},
+    {"id": "C5",  "problem": "@Profile picks the impl",                 "inject": "com.example.shop.order.OrderService#<init>(2:auditor)", "impl": "com.example.shop.audit.DevAuditor"},
+    {"id": "C6",  "problem": "bean from auto-config outside the scan",  "inject": "com.example.shop.order.OrderService#<init>(3:fraud)", "impl": "com.example.autoconfig.HttpFraudClient"},
+    {"id": "C7",  "problem": "Feign proxy = REST call",                 "proxy": "com.example.shop.client.InventoryClient", "expect": {"target": "inventory", "url": "http://inventory.prod.internal:8080", "calls": ["GET /api/stock/{sku} ← stock", "POST /api/reserve/{sku} ← reserve"]}},
+    {"id": "C8",  "problem": "Spring Data repo = table (@Table)",       "proxy": "com.example.shop.order.OrderRepository", "expect": {"resource": "t_order"}},
+    {"id": "C8b", "problem": "Spring Data repo = table (naming rule)",  "proxy": "com.example.shop.order.ShipmentLogRepository", "expect": {"resource": "shipment_log"}},
+    {"id": "C9",  "problem": "MyBatis-Plus mapper = table",             "proxy": "com.example.shop.mapper.UserMapper", "expect": {"resource": "t_user"}},
+    {"id": "C10a","problem": "@Async proxy",                            "proxy": "com.example.shop.notify.NotificationWorker#notifyLater", "expect": {"means": "async"}},
+    {"id": "C10b","problem": "@Transactional proxy",                    "proxy": "com.example.shop.order.OrderService#place", "expect": {"means": "transactional"}},
+    {"id": "C11a","problem": "REST path with ${prop:default} prefix",   "entry": "com.example.shop.web.OrderController#place", "resource": "POST /v1/orders/{sku}"},
+    {"id": "C11b","problem": "@Scheduled cron from property",           "entry": "com.example.shop.jobs.Listeners#reconcile", "resource": "0 */5 * * * *"},
+    {"id": "C11c","problem": "@KafkaListener topic from property",      "entry": "com.example.shop.jobs.Listeners#onOrder", "resource": "orders.v1"},
+    {"id": "C11d","problem": "@EventListener (event type)",             "entry": "com.example.shop.jobs.Listeners#onOrderEvent", "resource": "com.example.shop.handler.OrderEvent"},
+    {"id": "C11e","problem": "@XxlJob",                                 "entry": "com.example.shop.jobs.Listeners#syncInventory", "resource": "xxl-job:syncInventoryJob"},
+    {"id": "C11f","problem": "@RocketMQMessageListener (on class)",     "entry": "com.example.shop.jobs.PaymentConsumer#onMessage", "resource": "pay-result"},
+    {"id": "C12", "problem": "Map<String,Rule> strategy injection",     "inject": "com.example.shop.discount.DiscountService#<init>(0:rules)", "beans": ["seasonal", "vip"]},
+    {"id": "C13a","problem": "getBean(runtime name) is reported as a gap", "gap": "com.example.shop.discount.DiscountService#byName"},
+    {"id": "C13b","problem": "Class.forName is reported as a gap",      "gap": "com.example.shop.discount.DiscountService#byReflection"},
+    {"id": "C14", "problem": "Boot 2 key spring.redis.* flagged",       "gap": "spring.redis.host"},
+    {"id": "C15", "problem": "@ConditionalOnClass bean absent",         "absentBean": "fancyFraudClient"},
+    {"id": "C16", "problem": "generic type picks the impl",             "inject": "com.example.shop.order.OrderService#<init>(7:handler)", "impl": "com.example.shop.handler.OrderHandler"},
+    {"id": "C17", "problem": "secrets never in output",                 "secrets": ["S3cr3t-db-pass", "sk_live_DO_NOT_LEAK"]},
+    {"id": "C18", "problem": "resolved Kafka address",                  "property": "spring.kafka.bootstrap-servers", "value": "kafka-orders.prod.internal:9092"}
+  ]
+}

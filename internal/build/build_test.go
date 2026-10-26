@@ -3,6 +3,8 @@ package build
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +31,9 @@ func bareRepo(t *testing.T, root, name string, files map[string]string, branches
 	work, bare := filepath.Join(root, name+"-work"), filepath.Join(root, name+".git")
 	sh(t, root, "git", "init", "-q", "-b", "main", work)
 	for f, body := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(work, f)), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(work, f), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -81,12 +86,11 @@ func TestRunKnowledgeLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// per-domain overrides: together a runtime-only REST hop pay -> ord, plus a
-	// row naming another domain's service (rejected)
+	// per-domain overrides: a runtime-only REST hop pay -> ord (edges spec §6.1);
+	// orders' file holds nothing yet, and must be kept as written
 	for d, body := range map[string]string{
-		"payments": "- src: pay\n  kind: rest\n  channel: /charge\n  role: produce\n" +
-			"- src: ord\n  kind: rest\n  channel: /wrong\n  role: produce\n",
-		"orders": "- dst: ord\n  kind: rest\n  channel: /charge\n  role: consume\n",
+		"payments": "version: weaver/edges.override/v1.0\nedges:\n  - {from: pay, to: ord, kind: rest, resource: /charge}\n",
+		"orders":   "version: weaver/edges.override/v1.0\nedges: []\n",
 	} {
 		if err := os.MkdirAll(l.Domain(d), 0o755); err != nil {
 			t.Fatal(err)
@@ -116,10 +120,13 @@ func TestRunKnowledgeLayout(t *testing.T) {
 		t.Errorf("missing configured branch not reported:\n%s", log.String())
 	}
 	for _, d := range []string{"payments", "orders"} {
-		for _, f := range []string{l.KB(d), l.Zoekt(d), l.Versions(d), l.Graph(d), filepath.Join(l.Domain(d), "manifest.json")} {
+		for _, f := range []string{l.KB(d), l.Zoekt(d), l.Versions(d), l.EdgeMap(d), filepath.Join(l.Domain(d), "manifest.json")} {
 			if _, err := os.Stat(f); err != nil {
 				t.Errorf("missing %s", f)
 			}
+		}
+		if _, err := os.Stat(l.Graph(d)); !os.IsNotExist(err) {
+			t.Errorf("%s written without --graph", l.Graph(d))
 		}
 	}
 	if got := l.Domains(); len(got) != 2 || got[0] != "orders" || got[1] != "payments" {
@@ -154,8 +161,8 @@ func TestRunKnowledgeLayout(t *testing.T) {
 			t.Errorf("%s edges: %+v", d, all[0].Edges)
 		}
 	}
-	if !bytes.Contains(log.Bytes(), []byte(`payments override rest /wrong: service "ord" is not in domain payments`)) {
-		t.Errorf("cross-domain override row not rejected:\n%s", log.String())
+	if b, _ := os.ReadFile(l.EdgeMap("payments")); !bytes.Contains(b, []byte("resource: /charge")) {
+		t.Errorf("override edge missing from edges.yaml:\n%s", b)
 	}
 
 	// search per domain, carrying the domain
@@ -171,10 +178,10 @@ func TestRunKnowledgeLayout(t *testing.T) {
 	if err := Run(services, l, Options{Fetch: false, Log: &log}); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(l.Overrides("payments")); !bytes.HasPrefix(b, []byte("# Service edges of this domain")) {
+	if b, _ := os.ReadFile(l.Overrides("payments")); !bytes.HasPrefix(b, []byte("# Human corrections")) {
 		t.Errorf("template not created: %q", b)
 	}
-	if b, _ := os.ReadFile(l.Overrides("orders")); !bytes.HasPrefix(b, []byte("- dst: ord")) {
+	if b, _ := os.ReadFile(l.Overrides("orders")); !bytes.HasPrefix(b, []byte("version: weaver/edges.override/v1.0\nedges: []")) {
 		t.Errorf("existing overrides overwritten: %q", b)
 	}
 	if all, _ := snapshot.LoadAll(l.Versions("payments")); len(all) != 2 {
@@ -233,6 +240,31 @@ func TestRunKnowledgeLayout(t *testing.T) {
 	if !bytes.Contains(log.Bytes(), []byte("orders: existing knowledge unreadable")) {
 		t.Errorf("broken neighbour not reported:\n%s", log.String())
 	}
+	if err := Run(services, l, Options{Log: &log, Graph: true}); err != nil {
+		t.Fatalf("--graph: %v\n%s", err, log.String())
+	}
+	if _, err := os.Stat(l.Graph("payments")); err != nil {
+		t.Errorf("--graph: %v", err)
+	}
+	// every build is a generation; current points at the newest, older ones stay
+	n := l.BuildID("payments")
+	if n < 1 || !strings.HasSuffix(l.EdgeMap("payments"), filepath.Join("current", "edges.yaml")) {
+		t.Errorf("builds are generations, read through current: %d %s", n, l.EdgeMap("payments"))
+	}
+	if err := Run(services, l, Options{Fetch: false, Log: &log}); err != nil {
+		t.Fatalf("%v\n%s", err, log.String())
+	}
+	if l.BuildID("payments") != n+1 {
+		t.Errorf("next build: generation %d, got %d", n+1, l.BuildID("payments"))
+	}
+	for _, f := range []string{"edges.yaml", "releases.yaml", "build.yaml", "edges.override.yaml", "facts/pay.yaml"} {
+		if _, err := os.Stat(filepath.Join(l.Gen("payments", n), f)); err != nil {
+			t.Errorf("generation %d kept: %v", n, err)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(l.Current("payments"), "build.yaml")); !strings.Contains(string(b), fmt.Sprintf("build: %d", n+1)) {
+		t.Errorf("build.yaml: %s", b)
+	}
 }
 
 func TestLoadSourcesRejects(t *testing.T) {
@@ -246,6 +278,8 @@ func TestLoadSourcesRejects(t *testing.T) {
 		"option url":     "services:\n  - serviceName: x\n    gitUrl: --upload-pack=touch /tmp/pwned\n    branch: b\n",
 		"no scheme url":  "services:\n  - serviceName: x\n    gitUrl: example.com/x.git\n    branch: b\n",
 		"option branch":  "services:\n  - serviceName: x\n    gitUrl: https://h/x\n    branch: --upload-pack=x\n",
+		"root escapes":   "services:\n  - serviceName: x\n    gitUrl: https://h/x\n    branch: b\n    root: ../other\n",
+		"absolute root":  "services:\n  - serviceName: x\n    gitUrl: https://h/x\n    branch: b\n    root: /etc\n",
 	} {
 		p := filepath.Join(td, "sources.yaml")
 		if err := os.WriteFile(p, []byte(yml), 0o644); err != nil {
@@ -257,6 +291,28 @@ func TestLoadSourcesRejects(t *testing.T) {
 	}
 	if _, err := LoadSources(filepath.Join(td, "sources.yaml"), "../x"); err == nil {
 		t.Error("unsafe domain: expected an error")
+	}
+}
+
+// A monorepo: one entry per service, same gitUrl, each with its own root.
+func TestLoadSourcesRoot(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "sources.yaml")
+	yml := "services:\n  - {serviceName: cart, gitUrl: https://h/shop, branch: main, root: app/cart/}\n" +
+		"  - {serviceName: catalog, gitUrl: https://h/shop, branch: main, root: ./app/catalog}\n" +
+		"  - {serviceName: web, gitUrl: https://h/web, branch: main}\n"
+	if err := os.WriteFile(p, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadSources(p, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s[0].Root != "app/cart" || s[1].Root != "app/catalog" || s[2].Root != "" {
+		t.Errorf("roots: %+v", s)
+	}
+	m := snapshot.Manifest{ServiceName: "cart", Root: s[0].Root}
+	if m.Dir("src") != filepath.Join("src", "cart") || m.Code("src") != filepath.Join("src", "cart", "app", "cart") {
+		t.Errorf("clone %s, code %s", m.Dir("src"), m.Code("src"))
 	}
 }
 
@@ -290,9 +346,9 @@ func TestScanExistingSources(t *testing.T) {
 	}
 	var log bytes.Buffer
 	m := Scan([]Service{
-		{"pay", "checkout", "u1", "release/2.0"}, // on main, config says release/2.0
-		{"pay", "copy", "u2", "release/1.0"},
-		{"pay", "gone", "u3", "release/1.0"},
+		{"pay", "checkout", "u1", "release/2.0", ""}, // on main, config says release/2.0
+		{"pay", "copy", "u2", "release/1.0", ""},
+		{"pay", "gone", "u3", "release/1.0", ""},
 	}, src, &log)
 	if len(m) != 2 {
 		t.Fatalf("manifest: %+v\n%s", m, log.String())
@@ -315,7 +371,7 @@ func TestScanExistingSources(t *testing.T) {
 func TestRunNothingAvailable(t *testing.T) {
 	td := t.TempDir()
 	l := Layout{Root: filepath.Join(td, "knowledge"), SourcesRoot: filepath.Join(td, "sources")}
-	svcs := []Service{{"pay", "a", "file://" + filepath.Join(td, "missing.git"), "main"}}
+	svcs := []Service{{"pay", "a", "file://" + filepath.Join(td, "missing.git"), "main", ""}}
 	var log bytes.Buffer
 	err := Run(svcs, l, Options{Fetch: true, Log: &log})
 	if err == nil || !strings.Contains(err.Error(), "none of its 1 services is available") {
@@ -358,7 +414,7 @@ func TestScipCache(t *testing.T) {
 		sh(t, repo, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f)
 	}
 	commit("go.mod", "module svc\n")
-	svcs := []Service{{"pay", "svc", "file://unused", "main"}}
+	svcs := []Service{{"pay", "svc", "file://unused", "main", ""}}
 	var log bytes.Buffer
 	build := func(o Options) {
 		t.Helper()
@@ -409,5 +465,35 @@ func TestScipCache(t *testing.T) {
 	build(Options{Reindex: true})
 	if runs() != 6 {
 		t.Errorf("--reindex did not retry the failed root (%d runs)", runs())
+	}
+}
+
+// A monorepo's services (same gitUrl, own root) share one clone, fetched once;
+// a root missing from the repo skips only that service.
+func TestSyncMonorepoSharesClone(t *testing.T) {
+	td := t.TempDir()
+	url := bareRepo(t, td, "shop", map[string]string{"app/cart/main.go": "package main\n", "app/catalog/main.go": "package main\n"})
+	src := filepath.Join(td, "sources")
+	svcs := []Service{{"d", "cart", url, "main", "app/cart"}, {"d", "catalog", url, "main", "app/catalog"}, {"d", "ghost", url, "main", "app/ghost"}}
+	var log bytes.Buffer
+	ms, err := Sync(svcs, src, "", "", &log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 2 || ms[0].Clone == "" || ms[0].Clone != ms[1].Clone || ms[0].SHA != ms[1].SHA {
+		t.Fatalf("manifests: %+v\n%s", ms, log.String())
+	}
+	if ms[1].Code(src) != filepath.Join(src, ms[0].Clone, "app/catalog") {
+		t.Errorf("catalog's code: %s", ms[1].Code(src))
+	}
+	ents, _ := os.ReadDir(src)
+	if len(ents) != 1 || ents[0].Name() != ms[0].Clone {
+		t.Errorf("one clone on disk, got %v", ents)
+	}
+	if !strings.Contains(log.String(), "root app/ghost not in the repo") {
+		t.Errorf("ghost: %s", log.String())
+	}
+	if again := Scan(svcs[:2], src, io.Discard); len(again) != 2 || again[1].Clone != ms[0].Clone {
+		t.Errorf("--no-fetch reads the shared clone: %+v", again)
 	}
 }

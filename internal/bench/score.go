@@ -89,7 +89,12 @@ func Score(x *extract.Extractor, dir string) (Result, error) {
 	raw := x.ExtractAll(filepath.Join(dir, "services"))
 	predicted := map[[4]string]bool{}
 	for _, h := range graph.Resolve(raw) {
-		predicted[h.Key()] = true
+		k := h.Key()
+		if strings.HasPrefix(k[3], "<") { // unresolved on both sides: an honest miss, never a claimed edge
+			continue
+		}
+		k[3] = prefixForm(k[2], k[3])
+		predicted[k] = true
 	}
 	truthKeys, tierOf := map[[4]string]bool{}, map[[4]string]string{}
 	truthCh := map[[2]string]bool{}
@@ -136,7 +141,7 @@ func Score(x *extract.Extractor, dir string) (Result, error) {
 	// are honest misses, not junk.
 	junk := map[string]bool{}
 	for _, e := range raw {
-		if !strings.Contains(e.Channel, "<RUNTIME") && !strings.Contains(e.Channel, "<DYNAMIC") && !truthCh[[2]string{e.Kind, e.Channel}] {
+		if !strings.Contains(e.Channel, "<RUNTIME") && !strings.Contains(e.Channel, "<DYNAMIC") && !truthCh[[2]string{e.Kind, prefixForm(e.Kind, e.Channel)}] {
 			r.Junk++
 			junk[fmt.Sprintf("  %s %s (%s)", e.Kind, e.Channel, e.Role)] = true
 		}
@@ -197,4 +202,13 @@ func lessKey(a, b [4]string) bool {
 		}
 	}
 	return false
+}
+
+// prefixForm: the ground truth writes redis keys as prefixes (`session:`); the
+// extractor keeps the key pattern (`session:{}`, edges spec §4.2).
+func prefixForm(kind, ch string) string {
+	if kind == "redis" {
+		return strings.TrimSuffix(ch, "{}")
+	}
+	return ch
 }

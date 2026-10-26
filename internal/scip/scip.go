@@ -5,6 +5,7 @@ package scip
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
 	"fmt"
 	"os"
@@ -79,6 +80,9 @@ func Index(repoDir string, r Root, outScip string, timeout time.Duration) error 
 	cmd := exec.CommandContext(ctx, "scip-go", "--output", outScip)
 	if r.Tool == "scip-java" {
 		cmd = exec.CommandContext(ctx, "scip-java", "index", "--output", outScip)
+		// Maven: never build or push images (a docker plugin bound to the build reaches for a
+		// Docker host). Via MAVEN_OPTS: arguments after "--" would replace scip-java's own goals.
+		cmd.Env = append(os.Environ(), "MAVEN_OPTS="+strings.TrimSpace(os.Getenv("MAVEN_OPTS")+" -Ddocker.skip=true"))
 	}
 	cmd.Dir = filepath.Join(repoDir, r.Dir)
 	// kill the whole process group: the indexers spawn go list / gradle / mvn,
@@ -120,9 +124,10 @@ func reason(out []byte) string {
 
 // Part is one build root's index to ingest.
 type Part struct {
-	Scip   string // the indexer's index.scip
-	Repo   string // service name the rows are tagged with
-	Prefix string // the root's folder inside the repo ("" = repo root): paths become repo-relative
+	Scip    string // the indexer's index.scip
+	Repo    string // service name the rows are tagged with
+	Prefix  string // the root's folder inside the repo ("" = repo root): paths become repo-relative
+	Release string // the commit built: the release these documents belong to
 }
 
 // Schema: SCIP read straight from index.scip with the official bindings, kept
@@ -142,11 +147,87 @@ var indexes = []string{
 	"CREATE INDEX sym_name ON symbols(display_name)",
 }
 
+// docSchema: SCIP stored by document (build-spec §4). A document is one file's
+// SCIP data, keyed by a hash of its path and its occurrences and symbols, so a
+// file that didn't change shares its document with the releases before it, and
+// a monorepo's shared file is stored once. release_docs lists each service
+// release's documents; occurrences and symbols are views of the current
+// releases, so every query reads the code as it is now.
+var docSchema = []string{
+	`CREATE TABLE IF NOT EXISTS docs (doc TEXT PRIMARY KEY)`,
+	`CREATE TABLE IF NOT EXISTS doc_occ (doc TEXT, path TEXT, symbol TEXT, role INTEGER,
+		start_line INTEGER, start_char INTEGER, end_line INTEGER, end_char INTEGER,
+		enc_start_line INTEGER, enc_end_line INTEGER)`,
+	`CREATE TABLE IF NOT EXISTS doc_sym (doc TEXT, symbol TEXT, display_name TEXT)`,
+	`CREATE TABLE IF NOT EXISTS release_docs (repo TEXT, release TEXT, doc TEXT, current INTEGER, UNIQUE(repo, release, doc))`,
+	`CREATE VIEW IF NOT EXISTS occurrences AS SELECT r.repo AS repo, o.path, o.symbol, o.role, o.start_line, o.start_char,
+		o.end_line, o.end_char, o.enc_start_line, o.enc_end_line
+		FROM release_docs r JOIN doc_occ o ON o.doc = r.doc WHERE r.current = 1`,
+	`CREATE VIEW IF NOT EXISTS symbols AS SELECT r.repo AS repo, s.symbol, s.display_name
+		FROM release_docs r JOIN doc_sym s ON s.doc = r.doc WHERE r.current = 1`,
+}
+
+var docIndexes = []string{
+	"CREATE INDEX IF NOT EXISTS doc_occ_doc ON doc_occ(doc)",
+	"CREATE INDEX IF NOT EXISTS doc_occ_symbol ON doc_occ(symbol, role)",
+	"CREATE INDEX IF NOT EXISTS doc_occ_file ON doc_occ(path, start_line)",
+	"CREATE INDEX IF NOT EXISTS doc_sym_doc ON doc_sym(doc)",
+	"CREATE INDEX IF NOT EXISTS doc_sym_name ON doc_sym(display_name)",
+	"CREATE INDEX IF NOT EXISTS release_docs_doc ON release_docs(doc, current)",
+	"CREATE INDEX IF NOT EXISTS release_docs_repo ON release_docs(repo, current)",
+}
+
+// CarryForward copies every release of the previous kb.db that isn't being
+// rebuilt now (another commit of a service, or a service no longer built) into
+// kb, as not current, with the documents they list: old releases are never
+// indexed again, and never lost. A previous kb.db without documents has none.
+func CarryForward(kb *sql.DB, prevPath string, built map[string]string) error {
+	if _, err := os.Stat(prevPath); err != nil {
+		return nil
+	}
+	for _, q := range docSchema {
+		if _, err := kb.Exec(q); err != nil {
+			return err
+		}
+	}
+	if _, err := kb.Exec("ATTACH DATABASE ? AS prev", prevPath); err != nil {
+		return err
+	}
+	defer kb.Exec("DETACH DATABASE prev")
+	var n int
+	if kb.QueryRow("SELECT count(*) FROM prev.sqlite_master WHERE name = 'release_docs'").Scan(&n); n == 0 {
+		return nil
+	}
+	if _, err := kb.Exec("CREATE TEMP TABLE built (repo TEXT PRIMARY KEY, release TEXT)"); err != nil {
+		return err
+	}
+	defer kb.Exec("DROP TABLE temp.built")
+	for repo, rel := range built {
+		if _, err := kb.Exec("INSERT INTO temp.built VALUES (?, ?)", repo, rel); err != nil {
+			return err
+		}
+	}
+	for _, q := range []string{
+		`INSERT OR IGNORE INTO release_docs SELECT r.repo, r.release, r.doc, 0 FROM prev.release_docs r
+			WHERE NOT EXISTS (SELECT 1 FROM temp.built b WHERE b.repo = r.repo AND b.release = r.release)`,
+		`INSERT OR IGNORE INTO docs SELECT d.doc FROM prev.docs d WHERE d.doc IN (SELECT doc FROM release_docs)`,
+		`INSERT INTO doc_occ SELECT o.* FROM prev.doc_occ o WHERE o.doc IN (SELECT doc FROM release_docs)
+			AND o.doc NOT IN (SELECT doc FROM doc_occ)`,
+		`INSERT INTO doc_sym SELECT s.* FROM prev.doc_sym s WHERE s.doc IN (SELECT doc FROM release_docs)
+			AND s.doc NOT IN (SELECT doc FROM doc_sym)`,
+	} {
+		if _, err := kb.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Ingest reads each part's index.scip into kb. An occurrence with an invalid
 // range (seen from scip-java: negative offsets) is skipped on its own — it no
 // longer costs the whole repo its index. Returns the count skipped.
 func Ingest(kb *sql.DB, parts []Part) (skipped int, err error) {
-	for _, q := range schema {
+	for _, q := range docSchema {
 		if _, err := kb.Exec(q); err != nil {
 			return 0, err
 		}
@@ -158,7 +239,7 @@ func Ingest(kb *sql.DB, parts []Part) (skipped int, err error) {
 		}
 		skipped += n
 	}
-	for _, q := range indexes {
+	for _, q := range docIndexes {
 		if _, err := kb.Exec(q); err != nil {
 			return skipped, err
 		}
@@ -180,30 +261,42 @@ func ingestOne(kb *sql.DB, p Part) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	occ, err := tx.Prepare("INSERT INTO occurrences VALUES (?,?,?,?,?,?,?,?,?,?)")
+	occ, err := tx.Prepare("INSERT INTO doc_occ VALUES (?,?,?,?,?,?,?,?,?,?)")
 	if err != nil {
 		return 0, err
 	}
 	defer occ.Close()
-	sym, err := tx.Prepare("INSERT INTO symbols VALUES (?,?,?)")
+	sym, err := tx.Prepare("INSERT INTO doc_sym VALUES (?,?,?)")
 	if err != nil {
 		return 0, err
 	}
 	defer sym.Close()
 	skipped := 0
+	type orow struct {
+		s                string
+		role             int32
+		sl, sc, el, ec   int32
+		encStart, encEnd any
+	}
 	for _, doc := range idx.GetDocuments() {
 		path := filepath.ToSlash(filepath.Join(p.Prefix, doc.GetRelativePath()))
+		if path == ".." || strings.HasPrefix(path, "../") {
+			continue // outside the repo, e.g. scip-go's generated test files in the build cache
+		}
+		h := sha1.New()
+		fmt.Fprintf(h, "%s\x00", path)
+		var syms [][2]string
 		for _, si := range doc.GetSymbols() {
 			if s := si.GetSymbol(); s != "" && !strings.HasPrefix(s, "local ") {
 				name := si.GetDisplayName()
 				if name == "" {
 					name = SymbolName(s)
 				}
-				if _, err := sym.Exec(p.Repo, s, name); err != nil {
-					return 0, err
-				}
+				syms = append(syms, [2]string{s, name})
+				fmt.Fprintf(h, "s%s\x00%s\x00", s, name)
 			}
 		}
+		var occs []orow
 		for _, o := range doc.GetOccurrences() {
 			s := o.GetSymbol()
 			if s == "" || strings.HasPrefix(s, "local ") {
@@ -214,14 +307,30 @@ func ingestOne(kb *sql.DB, p Part) (int, error) {
 				skipped++
 				continue
 			}
-			var encStart, encEnd any // NULL when the indexer gives no enclosing range
+			row := orow{s: s, role: o.GetSymbolRoles(), sl: r.Start.Line, sc: r.Start.Character, el: r.End.Line, ec: r.End.Character}
 			if e, ok := occRange(o.GetEnclosingRange(), o.GetSingleLineEnclosingRange(), o.GetMultiLineEnclosingRange()); ok {
-				encStart, encEnd = e.Start.Line, e.End.Line
+				row.encStart, row.encEnd = e.Start.Line, e.End.Line
 			}
-			if _, err := occ.Exec(p.Repo, path, s, o.GetSymbolRoles(),
-				r.Start.Line, r.Start.Character, r.End.Line, r.End.Character, encStart, encEnd); err != nil {
-				return 0, err
+			occs = append(occs, row)
+			fmt.Fprintf(h, "o%s\x00%d %d %d %d %d %v %v\x00", s, row.role, row.sl, row.sc, row.el, row.ec, row.encStart, row.encEnd)
+		}
+		id := fmt.Sprintf("%x", h.Sum(nil))
+		if res, err := tx.Exec("INSERT OR IGNORE INTO docs VALUES (?)", id); err != nil {
+			return 0, err
+		} else if n, _ := res.RowsAffected(); n == 1 { // a document not stored yet
+			for _, x := range syms {
+				if _, err := sym.Exec(id, x[0], x[1]); err != nil {
+					return 0, err
+				}
 			}
+			for _, o := range occs {
+				if _, err := occ.Exec(id, path, o.s, o.role, o.sl, o.sc, o.el, o.ec, o.encStart, o.encEnd); err != nil {
+					return 0, err
+				}
+			}
+		}
+		if _, err := tx.Exec("INSERT OR IGNORE INTO release_docs VALUES (?, ?, ?, 1)", p.Repo, p.Release, id); err != nil {
+			return 0, err
 		}
 	}
 	return skipped, tx.Commit()
@@ -307,7 +416,7 @@ func WrapperSymbols(kb *sql.DB) (map[string]extract.Wrapper, error) {
 	for _, s := range Sinks {
 		rows, err := kb.Query(`SELECT DISTINCT d.symbol FROM occurrences r
 			JOIN occurrences d ON d.repo = r.repo AND d.path = r.path AND (d.role & 1) = 1
-			  AND d.symbol LIKE '%#%().'
+			  AND (d.symbol LIKE '%#%().' OR (d.symbol LIKE 'scip-go %#%.' AND d.symbol NOT LIKE '%#'))
 			  AND (d.enc_start_line IS NULL OR r.start_line BETWEEN d.enc_start_line AND d.enc_end_line)
 			WHERE r.symbol LIKE ? AND (r.role & 1) = 0`, "%"+s.Symbol+"%")
 		if err != nil {
@@ -330,7 +439,47 @@ func WrapperSymbols(kb *sql.DB) (map[string]extract.Wrapper, error) {
 			return nil, err
 		}
 	}
-	return out, nil
+	return out, interfaceWrappers(kb, out)
+}
+
+// interfaceWrappers adds the interface side of each wrapper: callers of an
+// injected RedisService call RedisService#get(), not RedisServiceImpl#get().
+// kb.db keeps no SCIP relationships, so a method counts when a type its
+// wrapper's file references (`implements RedisService`) defines a method of
+// the same descriptor. ponytail: name + referenced type, not the real
+// is_implementation relationship; store relationships if this ever misfires.
+func interfaceWrappers(kb *sql.DB, out map[string]extract.Wrapper) error {
+	impls := map[string]extract.Wrapper{}
+	for k, v := range out {
+		impls[k] = v
+	}
+	for sym, w := range impls {
+		i := strings.LastIndex(sym, "#")
+		if i < 0 {
+			continue
+		}
+		desc := sym[i:] // #get().
+		rows, err := kb.Query(`SELECT DISTINCT m.symbol FROM occurrences d
+			JOIN occurrences t ON t.repo = d.repo AND t.path = d.path AND (t.role & 1) = 0 AND t.symbol LIKE '%#'
+			JOIN occurrences m ON (m.role & 1) = 1 AND m.symbol = t.symbol || substr(?, 2)
+			WHERE d.symbol = ? AND (d.role & 1) = 1`, desc, sym)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var m string
+			if rows.Scan(&m) == nil && m != sym {
+				if _, ok := out[m]; !ok {
+					out[m] = w
+				}
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // WrappersUsed scopes wrappers to the services that call them: for each repo in
@@ -367,7 +516,7 @@ func WrappersUsed(kb *sql.DB, wrappers map[string]extract.Wrapper) (map[string]m
 
 func hasSCIP(kb *sql.DB) (bool, error) {
 	var n int
-	err := kb.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='occurrences'").Scan(&n)
+	err := kb.QueryRow("SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name='occurrences'").Scan(&n)
 	return n > 0, err
 }
 
@@ -380,5 +529,5 @@ func MethodName(sym string) string {
 		return ""
 	}
 	name, _, _ := strings.Cut(after, "(")
-	return strings.Trim(name, "`")
+	return strings.Trim(strings.TrimSuffix(name, "."), "`") // scip-go: Type#Method. (no parens)
 }

@@ -122,7 +122,7 @@ func (k *KB) FindReferences(q string, limit int) ([]Location, error) {
 
 func hasTable(db *sql.DB, name string) bool {
 	var n int
-	_ = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&n)
+	_ = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name=?", name).Scan(&n)
 	return n > 0
 }
 
@@ -258,76 +258,81 @@ func BlastRadius(edges []Hop, service, direction string, maxHops int) Blast {
 	return b
 }
 
-// Context builds the system prompt for a plain-English question: services named
-// in the query, each with its resolved inbound/outbound edges, under rules that
-// forbid the model from inventing connections. only (nil = all) limits which
-// services can be named; their edges still reach services outside it.
-func (k *KB) Context(query string, only map[string]bool) (string, error) {
-	rows, err := k.ServiceFlow("")
-	if err != nil {
-		return "", err
-	}
-	seen := map[string]bool{}
-	var services []string
-	for _, r := range rows {
-		for _, s := range []string{r.Src, r.Dst} {
-			if s != "" && !seen[s] {
-				seen[s] = true
-				services = append(services, s)
-			}
-		}
-	}
-	sort.Strings(services)
+// Peer is the other end of one hop.
+type Peer struct {
+	Service string `json:"service"`
+	Kind    string `json:"kind"`
+	Channel string `json:"channel"`
+}
 
-	lq := strings.ToLower(query)
-	var found []string
-	for _, s := range services {
-		if only != nil && !only[s] {
-			continue
-		}
-		if containsWord(lq, strings.ToLower(s)) {
-			found = append(found, s)
-		}
-	}
-	if len(found) == 0 {
-		return "<architecture_graph>\nNo relevant architectural services found in your query.\n</architecture_graph>", nil
-	}
+// ServiceContext is the graph around one service: what it calls, what calls it.
+type ServiceContext struct {
+	Service  string `json:"service"`
+	Domain   string `json:"domain,omitempty"`
+	Outbound []Peer `json:"outbound"`
+	Inbound  []Peer `json:"inbound"`
+}
 
+// Context: each named service's direct hops (one hop out, one hop in), as data —
+// the facts a caller (falcon) puts in front of a model in its own words. An
+// unknown service is an error, not silently skipped.
+func (k *KB) Context(services []string) ([]ServiceContext, error) {
 	hops, err := k.ResolvedEdges()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var ctx strings.Builder
-	for _, s := range found {
-		fmt.Fprintf(&ctx, "Service: %s\n", s)
-		var out, in []string
+	domainOf, err := k.domains()
+	if err != nil {
+		return nil, err
+	}
+	known := map[string]bool{}
+	for s := range domainOf {
+		known[s] = true
+	}
+	for _, h := range hops {
+		known[h.Src], known[h.Dst] = true, true
+	}
+	out := []ServiceContext{}
+	for _, s := range services {
+		if !known[s] {
+			return nil, fmt.Errorf("unknown service %q", s)
+		}
+		c := ServiceContext{Service: s, Domain: domainOf[s], Outbound: []Peer{}, Inbound: []Peer{}}
 		for _, h := range hops {
 			if h.Src == s {
-				out = append(out, fmt.Sprintf("- OUTBOUND: Calls `%s` via `%s` on channel `%s`\n", h.Dst, h.Kind, h.Channel))
+				c.Outbound = append(c.Outbound, Peer{h.Dst, h.Kind, h.Channel})
 			}
 			if h.Dst == s {
-				in = append(in, fmt.Sprintf("- INBOUND: Called by `%s` via `%s` on channel `%s`\n", h.Src, h.Kind, h.Channel))
+				c.Inbound = append(c.Inbound, Peer{h.Src, h.Kind, h.Channel})
 			}
 		}
-		for _, l := range append(out, in...) {
-			ctx.WriteString(l)
-		}
-		if len(out)+len(in) == 0 {
-			ctx.WriteString("- No known dependencies.\n")
-		}
-		ctx.WriteString("\n")
+		out = append(out, c)
 	}
-	return `<system_instructions>
-You are a Staff-Level Software Architect Assistant. You MUST obey these rules with 100% accuracy:
-1. If a network connection is not listed in the <architecture_graph> block below, you MUST state that no connection exists. Do not guess or assume.
-2. Base all architectural advice solely on the deterministic edges provided.
-3. If the user asks about data schemas or code that is not present in this graph, explicitly state "Schema/Code not found in current context."
-</system_instructions>
+	return out, nil
+}
 
-<architecture_graph>
-` + strings.TrimSpace(ctx.String()) + `
-</architecture_graph>
-`, nil
+// domains: service -> domain, from each domain's `domains` table.
+func (k *KB) domains() (map[string]string, error) {
+	out := map[string]string{}
+	err := k.each(func(db *sql.DB) error {
+		if !hasTable(db, "domains") {
+			return nil
+		}
+		rows, err := db.Query("SELECT service, domain FROM domains")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var s, d string
+			if err := rows.Scan(&s, &d); err != nil {
+				return err
+			}
+			out[s] = d
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // SymbolNames: distinct symbol display names starting with prefix (for shell
@@ -365,30 +370,4 @@ func (k *KB) SymbolNames(prefix string, limit int) ([]string, error) {
 // `%` (common in symbol names) are otherwise wildcards.
 func likeEscape(s string) string {
 	return strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(s)
-}
-
-func isWordByte(b byte) bool {
-	return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
-}
-
-// containsWord: w occurs in s as a whole word (a regex \bw\b, without
-// compiling one per service per question).
-func containsWord(s, w string) bool {
-	if w == "" {
-		return false
-	}
-	for i := 0; ; {
-		j := strings.Index(s[i:], w)
-		if j < 0 {
-			return false
-		}
-		j += i
-		before := j == 0 || !isWordByte(s[j-1]) || !isWordByte(w[0])
-		end := j + len(w)
-		after := end == len(s) || !isWordByte(s[end]) || !isWordByte(w[len(w)-1])
-		if before && after {
-			return true
-		}
-		i = j + 1
-	}
 }

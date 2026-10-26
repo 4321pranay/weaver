@@ -1,0 +1,33 @@
+# production values answered with `spring-probe answer`, read by `spring-probe capture`
+spring.profiles.active:
+  value: "prod"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.417777009Z"
+cache.type:
+  value: "redis"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420299095Z"
+jobs.reconcile.cron:
+  value: "0 0 * * * *"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420434795Z"
+topics.orders:
+  value: "orders.prod.v2"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420553672Z"
+api.prefix:
+  value: "/api"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420655930Z"
+inventory.url:
+  value: "http://inventory.svc:8080"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420764873Z"
+spring.kafka.bootstrap-servers:
+  value: "kafka-prod-1:9092"
+  by: "pranay"
+  at: "2026-10-25T06:30:59.420949674Z"
+rocketmq.name-server:
+  value: "rocketmq-prod:9876"
+  by: "4321pranay"
+  at: "2026-10-25T06:33:35.338136553Z"

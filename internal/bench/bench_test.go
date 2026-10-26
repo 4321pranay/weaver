@@ -26,9 +26,11 @@ func benchmarks(t *testing.T) string {
 func TestBenchmarks(t *testing.T) {
 	root := benchmarks(t)
 	for dir, want := range map[string][2]int{ // {caught, catchable}
-		"core":         {7, 7},
-		"generated":    {100, 100},
-		"generated_1k": {1000, 1000},
+		"core": {7, 7},
+		// 11% of the generated cases use `#{T(Topics).X}` with no Topics class in the
+		// corpus: their truth needs a naming guess, which weaver no longer makes
+		"generated":    {89, 100},
+		"generated_1k": {889, 1000},
 		"adversarial":  {17, 17},
 		"complex":      {7, 8},
 	} {

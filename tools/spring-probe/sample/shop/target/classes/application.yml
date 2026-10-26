@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: shop
+  datasource:
+    url: jdbc:mysql://db-shop.prod.internal:3306/shop
+    username: shop
+    password: S3cr3t-db-pass
+  kafka:
+    bootstrap-servers: kafka-orders.prod.internal:9092
+  redis:                       # C14: Boot 2 key, silently ignored by Boot 3 (spring.data.redis.*)
+    host: redis-cache.prod.internal
+cache:
+  type: local                  # C4: picks LocalCache over RedisCache
+topics:
+  orders: orders.v1
+jobs:
+  reconcile:
+    cron: "0 */5 * * * *"
+inventory:
+  url: http://inventory.prod.internal:8080
+payment:
+  api-key: sk_live_DO_NOT_LEAK # C17: must never reach the output
+rocketmq:
+  name-server: rocketmq.prod.internal:9876

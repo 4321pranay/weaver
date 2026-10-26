@@ -17,6 +17,8 @@
     --redis: #d55181;
     --db:    #c98500;
     --grpc:  #1baf7a;
+    --external: #7a8494;
+    --ceph:  #8a5cc2;
     /* domain tints — one hue family per domain, kept muted (nodes read by shape+label) */
     --d-0:       #8a6d3b;
     --d-1:   #b8532e;
@@ -34,7 +36,7 @@
       color-scheme: dark;
       --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --border: #363b41;
       --ink: #e9ece8; --ink-2: #a6ac9f; --ink-3: #6e7468; --accent: #f0743c; --focus-ring: #f0743c;
-      --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c;
+      --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c; --external: #9aa3b2; --ceph: #a57fdc;
     --diff-add: #37c46e; --diff-rem: #f0605f; --diff-chg: #edb24a;
       --d-0:#c1a06a; --d-1:#e08a5f; --d-2:#5cb488; --d-3:#5b9dd0;
       --d-4:#c891d3; --d-5:#e0bd52; --d-6:#9aa1ab;
@@ -45,7 +47,7 @@
     color-scheme: dark;
     --bg: #15171a; --surface: #1d2024; --surface-2: #262a2f; --border: #363b41;
     --ink: #e9ece8; --ink-2: #a6ac9f; --ink-3: #6e7468; --accent: #f0743c; --focus-ring: #f0743c;
-    --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c;
+    --rest: #3987e5; --kafka: #35a35a; --redis: #e87ba4; --db: #eda100; --grpc: #1fc98c; --external: #9aa3b2; --ceph: #a57fdc;
     --diff-add: #37c46e; --diff-rem: #f0605f; --diff-chg: #edb24a;
     --d-0:#c1a06a; --d-1:#e08a5f; --d-2:#5cb488; --d-3:#5b9dd0;
     --d-4:#c891d3; --d-5:#e0bd52; --d-6:#9aa1ab;
@@ -55,7 +57,7 @@
     color-scheme: light;
     --bg: #f5f6f4; --surface: #ffffff; --surface-2: #ecefea; --border: #dde1da;
     --ink: #191d17; --ink-2: #565b50; --ink-3: #8a8f82; --accent: #e2612a; --focus-ring:#e2612a;
-    --rest: #2a78d6; --kafka: #008300; --redis: #d55181; --db: #c98500; --grpc: #1baf7a;
+    --rest: #2a78d6; --kafka: #008300; --redis: #d55181; --db: #c98500; --grpc: #1baf7a; --external: #7a8494; --ceph: #8a5cc2;
     --diff-add: #1a9c4e; --diff-rem: #d23b3b; --diff-chg: #d98a1e;
     --d-0:#8a6d3b; --d-1:#b8532e; --d-2:#2f7d5a; --d-3:#2b6a9c;
     --d-4:#9c5aa8; --d-5:#b08a1e; --d-6:#6a7079;
@@ -317,7 +319,7 @@ const KINDS = ["rest", "kafka", "redis", "db", "grpc"];
 const DOMAINS = /*WEAVER:DOMAINS*/[];
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const kColor = k => css("--" + k);
-const kLabel = k => k === "db" ? "Database" : k;   // display name; type stays "db"
+const kLabel = k => ({ db: "Database", external: "External", ceph: "Ceph" })[k] || k;   // display name
 // domains take the 7 palette colours in order (cycling past 7)
 const dColor = d => { const i = DOMAINS.indexOf(d); return i < 0 ? "" : css("--d-" + (i % 7)); };
 
@@ -452,6 +454,8 @@ edges.forEach(e => {
   // invisible fat path = a comfortable click/hover target over the thin visible line
   e.hit = E("path", { class: "edge-hit", stroke: "transparent", "stroke-width": 12, fill: "none" });
   e.el = E("path", { class: "edge", stroke: kColor(e.kind), "marker-end": "url(#a-"+e.kind+")" });
+  // a call whose failure doesn't reach the caller (optional / fallback / async) is dashed
+  if (e.call && e.call !== "required") e.el.setAttribute("stroke-dasharray", "5 4");
   const enter = ev => edgeTip(ev, e), leave = hideTip, sel = ev => { ev.stopPropagation(); selectEdge(e); };
   e.hit.addEventListener("mousemove", enter);
   e.hit.addEventListener("mouseleave", leave);
@@ -676,6 +680,7 @@ function openEdgeDetail(e) {
     `<div class="dsec"><p class="eyebrow">Interface</p>` +
     `<div class="kvs">` +
     `<div class="kv"><span>transport</span><b>${e.kind}</b></div>` +
+    `<div class="kv"><span>call</span><b>${esc(e.call || "—")}</b></div>` +
     `<div class="kv"><span>${e.kind==="rest"?"method":e.kind==="grpc"?"stub":"channel"}</span>` +
       `<b>${esc(e.method || "—")}</b></div>` +
     `<div class="kv"><span>${e.kind==="rest"?"path":e.kind==="grpc"?"service":"name"}</span>` +

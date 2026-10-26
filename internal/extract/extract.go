@@ -11,19 +11,32 @@ package extract
 
 import (
 	"database/sql"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Edge is one raw extraction. produce: Src=service; consume: Dst=service.
 type Edge struct {
 	Src, Dst, Kind, Channel, Role, Repo string
+	// call site, for the edges map: repo-relative path, 0-based line (-1 when
+	// the edge has no single line), and the produce call's criticality (§5.1)
+	Path string
+	Line int
+	Call string
+	Host string // a REST call's target host, when its URL names one
+	// Match "name": a call recognised by its method name only, in a repo with
+	// no SCIP index (weaker than a SCIP-resolved call). "" = SCIP-resolved or
+	// an annotation / route.
+	Match string
+}
+
+// Site is a 0-based source line in a repo.
+type Site struct {
+	Path string
+	Line int
 }
 
 // SymbolValues: the string value of the constant referenced as ref (as written:
@@ -34,6 +47,15 @@ type SymbolValues interface {
 
 // Wrapper is a SCIP-resolved custom method that hides a transport sink.
 type Wrapper struct{ Kind, Role string }
+
+// Hit: what SCIP says a call site is (scip.ClientCalls). Resources, when set,
+// are the exact resources (generated gRPC code names them); else the resource is
+// argument Arg at the call site, -1 meaning its first literal argument.
+type Hit struct {
+	Kind, Role string
+	Arg        int
+	Resources  []string
+}
 
 // Extractor holds what is shared across repos in one run.
 type Extractor struct {
@@ -47,6 +69,10 @@ type Extractor struct {
 	// that file/line/column, its value read at its definition. Name-based Consts
 	// stay the fallback (repos SCIP couldn't index). nil = names only.
 	Symbols SymbolValues
+	// Calls: repo -> (path, line) -> method name -> what SCIP resolved that call
+	// to (scip.ClientCalls). A repo in here takes its calls from it alone; a
+	// repo missing from it falls back to method names, marked Match "name".
+	Calls map[string]map[Site]map[string][]Hit
 
 	mu     sync.Mutex
 	consts map[string]Consts // dir -> CollectConstants(dir), memoized
@@ -93,9 +119,16 @@ func (x *Extractor) collect(dir string) Consts {
 // the repo's own, then x.Consts or else the repo's PARENT dir, so sibling services
 // (a shared Constants module) resolve too.
 func (x *Extractor) ExtractRepo(repoDir string) []Edge {
+	return x.ExtractService(repoDir, filepath.Base(strings.TrimRight(repoDir, "/")), "")
+}
+
+// ExtractService extracts the service whose code is root in repoDir ("" = the
+// whole repo): a monorepo lists one service per root. Only files under root
+// give edges, and its config is root's; constants come from the whole repo, and
+// paths stay relative to repoDir, as SCIP's are.
+func (x *Extractor) ExtractService(repoDir, service, root string) []Edge {
 	repoDir = strings.TrimRight(repoDir, "/")
-	service := filepath.Base(repoDir)
-	config := loadConfig(repoDir)
+	config := ServiceConfig(repoDir, root)
 	// constants: this repo's own first, then the wider table (all sources in the
 	// build, or the sibling services); ambiguous names resolve to nothing
 	global := x.Consts
@@ -108,7 +141,7 @@ func (x *Extractor) ExtractRepo(repoDir string) []Edge {
 		global = &g
 	}
 	consts := x.collect(repoDir).Over(*global)
-	getters := collectGetterConfigs(repoDir, config)
+	getters := collectGetterConfigs(filepath.Join(repoDir, root), config)
 	var edges []Edge
 
 	activeProfile := config["spring.profiles.active"]
@@ -117,6 +150,9 @@ func (x *Extractor) ExtractRepo(repoDir string) []Edge {
 	}
 
 	for _, sf := range iterSrc(repoDir) {
+		if root != "" && !strings.HasPrefix(sf.rel, root+"/") {
+			continue
+		}
 		text := sf.text
 		profileTag := ""
 		if m := reProfile.FindStringSubmatch(text); m != nil && m[1] != activeProfile {
@@ -146,8 +182,29 @@ func (x *Extractor) ExtractRepo(repoDir string) []Edge {
 			}
 		}
 		mp := maps{config: config, vars: vars, lits: lits, consts: consts, getters: getters}
+		lang := "go"
+		if strings.HasSuffix(sf.name, ".java") || strings.HasSuffix(sf.name, ".kt") {
+			lang = "java"
+		}
+		f := parse([]byte(text), lang)
 
-		add := func(kind, role, raw string, unquoted bool, line int) {
+		var add func(kind, role, raw string, unquoted bool, line int)
+		calls, gated := x.Calls[service]
+		match := ""
+		// call: a method call matched by NAME, only in a repo SCIP couldn't index
+		call := func(kind, role string, a Arg) {
+			match = "name"
+			defer func() { match = "" }()
+			add(kind, role, a.Value, a.Unquoted, a.Line)
+		}
+		// hits: what SCIP resolved this call to; ok=false when the repo has no SCIP
+		var hits func(c Call) ([]Hit, bool)
+		if gated {
+			hits = func(c Call) ([]Hit, bool) { return calls[Site{sf.rel, c.Line}][c.Method], true }
+		} else {
+			hits = func(Call) ([]Hit, bool) { return nil, false }
+		}
+		add = func(kind, role, raw string, unquoted bool, line int) {
 			if raw == "" {
 				return
 			}
@@ -161,8 +218,14 @@ func (x *Extractor) ExtractRepo(repoDir string) []Edge {
 					return x.Symbols.Lookup(service, sf.rel, line, col+strings.LastIndex(ref, ".")+1, ref)
 				}
 			}
+			host := ""
+			m.host = &host
 			ch := normalizeChannel(kind, raw, unquoted, m) + profileTag
-			e := Edge{Kind: kind, Channel: ch, Role: role, Repo: service}
+			e := Edge{Kind: kind, Channel: ch, Role: role, Repo: service, Path: sf.rel, Line: line, Match: match, Host: host}
+			if (role == "produce" || kind == "redis" || kind == "db") && line >= 0 { // a call, not a handler
+				lt := sf.lines[line]
+				e.Call = f.criticality(line, len(lt)-len(strings.TrimLeft(lt, " \t")), len(strings.TrimRight(lt, " \t\r")), kind)
+			}
 			if role == "produce" {
 				e.Src = service
 			} else {
@@ -171,18 +234,13 @@ func (x *Extractor) ExtractRepo(repoDir string) []Edge {
 			edges = append(edges, e)
 		}
 
-		lang := "go"
-		if strings.HasSuffix(sf.name, ".java") || strings.HasSuffix(sf.name, ".kt") {
-			lang = "java"
-		}
-		f := parse([]byte(text), lang)
-		x.extractFile(f, service, text, add)
+		x.extractFile(f, service, text, add, call, hits)
 		f.close()
 	}
 	return edges
 }
 
-func (x *Extractor) extractFile(f *file, service, text string, add func(kind, role, raw string, unquoted bool, line int)) {
+func (x *Extractor) extractFile(f *file, service, text string, add func(kind, role, raw string, unquoted bool, line int), call func(kind, role string, a Arg), hits func(Call) ([]Hit, bool)) {
 	lang := f.lang
 	argAt := func(args []Arg, i int) (Arg, bool) {
 		if len(args) > i {
@@ -208,11 +266,17 @@ func (x *Extractor) extractFile(f *file, service, text string, add func(kind, ro
 			if a.Name == "KafkaListener" {
 				keys = []string{"topics", "value", "default"}
 			}
+			if a.OnType && k.Kind == "rest" {
+				continue // a class-level @RequestMapping is its methods' prefix, not a route
+			}
 			for _, key := range keys {
 				if v, ok := a.Kwargs[key]; ok {
 					role := k.Role
 					if feign && k.Kind == "rest" {
 						role = "produce"
+					}
+					if k.Kind == "rest" && a.Prefix != "" && !v.Unquoted {
+						v.Value = joinPath(a.Prefix, v.Value)
 					}
 					add(k.Kind, role, v.Value, v.Unquoted, v.Line)
 					break
@@ -229,6 +293,29 @@ func (x *Extractor) extractFile(f *file, service, text string, add func(kind, ro
 	}
 	for _, c := range f.calls() {
 		m, args := c.Method, c.Args
+		if lang == "go" && (m == "GET" || m == "POST" || m == "PUT" || m == "DELETE" || m == "HandleFunc" || m == "Handle") {
+			// a route declared (gin / net/http mux), not a call: syntax decides
+			if a, ok := argAt(args, 0); ok {
+				add("rest", "consume", a.Value, a.Unquoted, a.Line)
+			}
+			continue
+		}
+		if hs, ok := hits(c); ok {
+			// SCIP decides what the call is; the source gives only its arguments
+			for _, h := range hs {
+				if len(h.Resources) > 0 {
+					for _, r := range h.Resources {
+						add(h.Kind, h.Role, r, false, c.Line)
+					}
+					continue
+				}
+				if a, ok := hitArg(args, h.Arg); ok {
+					add(h.Kind, h.Role, a.Value, a.Unquoted, a.Line)
+				}
+			}
+			continue
+		}
+		// no SCIP for this repo: method names decide (Match "name")
 		if w, ok := x.Wrappers[service][m]; ok {
 			// SCIP resolved this custom method to a transport sink; the channel is
 			// the first literal arg at the call site (skips a Go ctx), else arg-0.
@@ -243,18 +330,18 @@ func (x *Extractor) extractFile(f *file, service, text string, add func(kind, ro
 				ch = &args[0]
 			}
 			if ch != nil {
-				add(w.Kind, w.Role, ch.Value, ch.Unquoted, ch.Line)
+				call(w.Kind, w.Role, *ch)
 			}
 			continue
 		}
 		switch {
 		case m == "uri" && webclient:
 			if a, ok := argAt(args, 0); ok {
-				add("rest", "produce", a.Value, a.Unquoted, a.Line)
+				call("rest", "produce", a)
 			}
 		case m == "send" || m == "SendMessage":
 			if a, ok := argAt(args, goIdx); ok {
-				add("kafka", "produce", a.Value, a.Unquoted, a.Line)
+				call("kafka", "produce", a)
 			}
 		case m == "getForObject" || m == "postForObject" || m == "exchange" ||
 			(c.Obj == "http" && (m == "Get" || m == "Post")) ||
@@ -265,26 +352,22 @@ func (x *Extractor) extractFile(f *file, service, text string, add func(kind, ro
 				i = 1
 			}
 			if a, ok := argAt(args, i); ok {
-				add("rest", "produce", a.Value, a.Unquoted, a.Line)
-			}
-		case lang == "go" && (m == "GET" || m == "POST" || m == "PUT" || m == "DELETE" || m == "HandleFunc" || m == "Handle"):
-			if a, ok := argAt(args, 0); ok {
-				add("rest", "consume", a.Value, a.Unquoted, a.Line)
+				call("rest", "produce", a)
 			}
 		case (m == "Set" || m == "set") && c.Obj != "http":
 			if a, ok := argAt(args, goIdx); ok {
-				add("redis", "produce", a.Value, a.Unquoted, a.Line)
+				call("redis", "produce", a)
 			}
 		case (m == "Get" || m == "get") && c.Obj != "System" && c.Obj != "os" && c.Obj != "http":
 			// chi/gin r.Get("/path", h) is a route (goChiRoutes owns it), not a redis key.
 			route := lang == "go" && len(args) > 0 && !args[0].Unquoted && strings.HasPrefix(args[0].Value, "/")
 			if a, ok := argAt(args, goIdx); ok && !route {
-				add("redis", "consume", a.Value, a.Unquoted, a.Line)
+				call("redis", "consume", a)
 			}
 		case strings.HasPrefix(m, "New") && strings.HasSuffix(m, "Client"):
-			add("grpc", "produce", m[3:len(m)-6], false, -1)
+			call("grpc", "produce", Arg{Value: m[3 : len(m)-6], Line: c.Line})
 		case strings.HasPrefix(m, "Register") && strings.HasSuffix(m, "Server"):
-			add("grpc", "consume", m[8:len(m)-6], false, -1)
+			call("grpc", "consume", Arg{Value: m[8 : len(m)-6], Line: c.Line})
 		}
 	}
 
@@ -341,67 +424,6 @@ func (x *Extractor) ExtractAll(reposDir string) []Edge {
 	return all
 }
 
-var overrideKinds = map[string]bool{"rest": true, "grpc": true, "kafka": true, "redis": true, "db": true}
-
-// LoadOverrides reads edges.override.yaml: a YAML list of {src, dst, kind, channel,
-// role} rows. A missing or comment-only file means no overrides. Every row is
-// validated, and a bad one fails with its line — a hand-added hop must never be
-// silently dropped.
-func LoadOverrides(path string) ([]Edge, error) {
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var doc yaml.Node
-	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if len(doc.Content) == 0 { // empty or only comments
-		return nil, nil
-	}
-	list := doc.Content[0]
-	if list.Kind != yaml.SequenceNode {
-		return nil, fmt.Errorf("%s:%d: expected a list of edges (- src: …)", path, list.Line)
-	}
-	var out []Edge
-	for _, item := range list.Content {
-		bad := func(format string, a ...any) error {
-			return fmt.Errorf("%s:%d: %s", path, item.Line, fmt.Sprintf(format, a...))
-		}
-		if item.Kind != yaml.MappingNode {
-			return nil, bad("each edge is a map of src, dst, kind, channel, role")
-		}
-		for i := 0; i < len(item.Content); i += 2 {
-			switch k := item.Content[i].Value; k {
-			case "src", "dst", "kind", "channel", "role":
-			default:
-				return nil, bad("unknown field %q (allowed: src, dst, kind, channel, role)", k)
-			}
-		}
-		var r struct{ Src, Dst, Kind, Channel, Role string }
-		if err := item.Decode(&r); err != nil {
-			return nil, bad("%v", err)
-		}
-		switch {
-		case r.Role != "produce" && r.Role != "consume":
-			return nil, bad("role %q: must be produce or consume", r.Role)
-		case !overrideKinds[r.Kind]:
-			return nil, bad("kind %q: must be rest, grpc, kafka, redis or db", r.Kind)
-		case r.Channel == "":
-			return nil, bad("channel is required")
-		case r.Role == "produce" && r.Src == "":
-			return nil, bad("a produce edge needs src (the calling service)")
-		case r.Role == "consume" && r.Dst == "":
-			return nil, bad("a consume edge needs dst (the receiving service)")
-		}
-		out = append(out, Edge{Src: r.Src, Dst: r.Dst, Kind: r.Kind, Channel: r.Channel, Role: r.Role})
-	}
-	return out, nil
-}
-
 // WriteEdges replaces the service_edges table in db.
 func WriteEdges(db *sql.DB, edges []Edge) error {
 	tx, err := db.Begin()
@@ -426,4 +448,29 @@ func WriteEdges(db *sql.DB, edges []Edge) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// hitArg: a hit's resource argument: index i, or (i < 0) the first literal
+// argument, else argument 0.
+func hitArg(args []Arg, i int) (Arg, bool) {
+	if i >= 0 {
+		if i < len(args) {
+			return args[i], true
+		}
+		return Arg{}, false
+	}
+	for _, a := range args {
+		if !a.Unquoted {
+			return a, true
+		}
+	}
+	if len(args) > 0 {
+		return args[0], true
+	}
+	return Arg{}, false
+}
+
+// joinPath: a type's mapping prefix and a member's path, one slash between.
+func joinPath(prefix, path string) string {
+	return "/" + strings.Trim(strings.TrimRight(prefix, "/")+"/"+strings.TrimLeft(path, "/"), "/")
 }

@@ -29,16 +29,22 @@ type Arg struct {
 	Line     int // 0-based source line of the argument (SCIP's numbering)
 }
 
-// Call is one call site: receiver text ("" when none), method name, arguments.
+// Call is one call site: receiver text ("" when none), method name, arguments,
+// and the 0-based line of the method name, where SCIP records the reference.
 type Call struct {
 	Obj, Method string
 	Args        []Arg
+	Line        int
 }
 
 // Annotation is a Java annotation with its arguments; the unnamed one is "default".
+// OnType: it annotates a class or interface. Prefix: for one on a member, the
+// path its enclosing type maps (class @RequestMapping, @FeignClient(path)).
 type Annotation struct {
 	Name   string
 	Kwargs map[string]Arg
+	OnType bool
+	Prefix string
 }
 
 type file struct {
@@ -172,7 +178,7 @@ func (f *file) calls() []Call {
 	walk(f.tree.RootNode(), func(n *sitter.Node) bool {
 		if n.Kind() == kind {
 			if name, obj, args := f.callParts(n); name != nil {
-				c := Call{Method: f.text(name)}
+				c := Call{Method: f.text(name), Line: int(name.StartPosition().Row)}
 				if obj != nil {
 					c.Obj = f.text(obj)
 				}
@@ -339,18 +345,12 @@ func (f *file) annotations() []Annotation {
 	walk(f.tree.RootNode(), func(n *sitter.Node) bool {
 		if n.Kind() == "annotation" {
 			if name := n.ChildByFieldName("name"); name != nil {
-				a := Annotation{Name: f.text(name), Kwargs: map[string]Arg{}}
-				if args := n.ChildByFieldName("arguments"); args != nil {
-					for _, c := range children(args) {
-						switch c.Kind() {
-						case "element_value_pair":
-							k, v := c.ChildByFieldName("key"), c.ChildByFieldName("value")
-							if k != nil && v != nil {
-								a.Kwargs[f.text(k)] = f.resolveArg(v)
-							}
-						case "(", ")", ",":
-						default:
-							a.Kwargs["default"] = f.resolveArg(c)
+				a := f.annotation(n, name)
+				if owner := n.Parent(); owner != nil && owner.Kind() == "modifiers" {
+					if decl := owner.Parent(); decl != nil {
+						a.OnType = isTypeDecl(decl)
+						if !a.OnType {
+							a.Prefix = f.typePrefix(decl)
 						}
 					}
 				}
@@ -360,6 +360,58 @@ func (f *file) annotations() []Annotation {
 		return true
 	})
 	return out
+}
+
+func (f *file) annotation(n, name *sitter.Node) Annotation {
+	a := Annotation{Name: f.text(name), Kwargs: map[string]Arg{}}
+	if args := n.ChildByFieldName("arguments"); args != nil {
+		for _, c := range children(args) {
+			switch c.Kind() {
+			case "element_value_pair":
+				k, v := c.ChildByFieldName("key"), c.ChildByFieldName("value")
+				if k != nil && v != nil {
+					a.Kwargs[f.text(k)] = f.resolveArg(v)
+				}
+			case "(", ")", ",":
+			default:
+				a.Kwargs["default"] = f.resolveArg(c)
+			}
+		}
+	}
+	return a
+}
+
+func isTypeDecl(n *sitter.Node) bool {
+	return n.Kind() == "class_declaration" || n.Kind() == "interface_declaration"
+}
+
+// typePrefix: the path the type enclosing n maps every member under: its
+// @RequestMapping's, or an @FeignClient's path. "" when none (or not literal).
+func (f *file) typePrefix(n *sitter.Node) string {
+	for ; n != nil && !isTypeDecl(n); n = n.Parent() {
+	}
+	if n == nil {
+		return ""
+	}
+	for _, m := range children(n) {
+		if m.Kind() != "modifiers" {
+			continue
+		}
+		for _, an := range children(m) {
+			name := an.ChildByFieldName("name")
+			if an.Kind() != "annotation" || name == nil {
+				continue
+			}
+			a := f.annotation(an, name)
+			keys := map[string][]string{"RequestMapping": {"path", "value", "default"}, "FeignClient": {"path"}}[a.Name]
+			for _, k := range keys {
+				if v, ok := a.Kwargs[k]; ok && !v.Unquoted {
+					return v.Value
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // ConstDef is a string constant a file declares, at its name's 0-based line.

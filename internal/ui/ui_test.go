@@ -8,20 +8,24 @@ import (
 	"strings"
 	"testing"
 
-	"weaver/internal/graph"
-	"weaver/internal/snapshot"
+	"weaver/internal/edgemap"
 )
 
 func TestWrite(t *testing.T) {
 	hostile := "</script><script>alert(1)</script>"
-	vs := []snapshot.Snapshot{
-		{Version: 1, TS: "2026-10-01T00:00:00", Commits: map[string]string{"pay": "a1"},
-			Edges: []graph.Hop{{Src: "pay", Dst: "ord", Kind: "kafka", Channel: "payments.done"}}},
-		{Version: 2, TS: "2026-10-02T00:00:00", Commits: map[string]string{"pay": "a2"},
-			Edges: []graph.Hop{{Src: "pay", Dst: "ord", Kind: "rest", Channel: hostile}}},
+	m := edgemap.Map{Version: edgemap.FormatEdges,
+		Nodes: []edgemap.Node{
+			{ID: "pay", Type: "service", Props: map[string]any{"domain": "payments"}},
+			{ID: "ord", Type: "service", Props: map[string]any{"domain": "orders"}},
+			{ID: "database/ledger", Type: "database"},
+		},
+		Edges: []edgemap.Edge{
+			{From: "pay", To: "ord", Kind: "rest", Resource: hostile, Call: "optional"},
+			{From: "pay", To: "database/ledger", Kind: "db", Resource: "entries", Op: "write", Call: "required"},
+		},
 	}
 	p := filepath.Join(t.TempDir(), "graph.html")
-	if err := Write(p, "payments", vs, map[string]string{"pay": "payments", "ord": "orders"}); err != nil {
+	if err := Write(p, "payments", m); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(p)
@@ -36,34 +40,29 @@ func TestWrite(t *testing.T) {
 		t.Error("title")
 	}
 	get := func(name string, v any) {
-		m := regexp.MustCompile(`(?m)^const ` + name + ` = (.*);$`).FindStringSubmatch(s)
-		if m == nil {
+		mm := regexp.MustCompile(`(?m)^const ` + name + ` = (.*);$`).FindStringSubmatch(s)
+		if mm == nil {
 			t.Fatalf("%s not embedded", name)
 		}
-		if err := json.Unmarshal([]byte(m[1]), v); err != nil {
+		if err := json.Unmarshal([]byte(mm[1]), v); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
-	var data graph.Graph
-	var domains []string
-	var vdata struct {
-		Versions []struct {
-			Version int64
-			Edges   [][4]string
-		}
+	var data struct {
+		Nodes []struct{ ID, Type, Domain, Label string }
+		Edges []struct{ Src, Dst, Kind, Channel, Call string }
 	}
+	var domains []string
 	get("DATA", &data)
 	get("DOMAINS", &domains)
-	get("VDATA", &vdata)
-	// the newest version is the graph; both domains show (ord is a cross-domain neighbour)
-	if len(data.Edges) != 1 || data.Edges[0].Channel != hostile {
-		t.Errorf("graph: %+v", data.Edges)
+	// the page draws exactly edges.yaml: same edges, with call; spec node types mapped to page types
+	if len(data.Edges) != 2 || data.Edges[0].Channel != hostile || data.Edges[0].Call != "optional" {
+		t.Errorf("edges: %+v", data.Edges)
+	}
+	if n := data.Nodes[2]; n.Type != "db" || n.Label != "ledger" {
+		t.Errorf("database node: %+v", n)
 	}
 	if strings.Join(domains, ",") != "orders,payments" {
 		t.Errorf("domains: %v", domains)
-	}
-	// versions use the drawn form: kafka goes through its topic node
-	if len(vdata.Versions) != 2 || vdata.Versions[0].Edges[0] != [4]string{"pay", "kafka:payments.done", "kafka", "payments.done"} {
-		t.Errorf("versions: %+v", vdata.Versions)
 	}
 }

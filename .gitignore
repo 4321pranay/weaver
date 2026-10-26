@@ -6,3 +6,8 @@ benchmarks/
 /bin/
 knowledge/
 sources/
+
+# tools build output
+tools/*/target/
+tools/gocg/gocg
+tools/javacg/cp.txt

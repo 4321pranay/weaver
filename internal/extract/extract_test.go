@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -23,7 +22,7 @@ func TestNormalizeChannel(t *testing.T) {
 	}{
 		{"var + literal concat", "rest", `baseUrl + "/v1/charge"`, true, maps{lits: lit}, "/v1/charge"},
 		{"bare known var", "kafka", "topicVar", true, maps{lits: lit}, "payments.authorized"},
-		{"redis prefix keeps prefix", "redis", `"session:"+userID`, true, maps{}, "session:"},
+		{"redis key keeps its pattern", "redis", `"session:"+userID`, true, maps{}, "session:{}"},
 		{"rest tail hole", "rest", `"http://ledger/v1/ledger/" + id`, true, maps{}, "/v1/ledger/{}"},
 		{"cross-file dotted const", "kafka", "Constants.Topics.CART_EVENTS", true, maps{consts: map[string]string{"CART_EVENTS": "cart.events"}}, "cart.events"},
 		{"String.format template", "rest", `String.format("/v1/users/%s/geo", x)`, true, maps{}, "/v1/users/{}/geo"},
@@ -34,7 +33,9 @@ func TestNormalizeChannel(t *testing.T) {
 		{"viper struct field ref", "kafka", "cfg.InventoryTopic", true, maps{consts: map[string]string{"InventoryTopic": "inventory.events"}}, "inventory.events"},
 		{"config placeholder", "kafka", "${topic.x}", false, maps{config: map[string]string{"topic.x": "x.events"}}, "x.events"},
 		{"unknown placeholder", "kafka", "${nope.key}", false, maps{}, "<RUNTIME_PARAMETER: nope.key>"},
-		{"SpEL T() constant", "kafka", "#{T(Topics).ORDER_PLACED}", false, maps{}, "order.placed"},
+		{"SpEL T() constant", "kafka", "#{T(Topics).ORDER_PLACED}", false, maps{consts: map[string]string{"ORDER_PLACED": "order.placed"}}, "order.placed"},
+		{"SpEL T() unknown: no guess", "kafka", "#{T(Topics).ORDER_PLACED}", false, maps{}, "<DYNAMIC_DISPATCH: #{T(Topics).ORDER_PLACED}>"},
+		{"unresolved dotted const: no guess", "kafka", "Topics.ORDERS_CREATED", true, maps{}, "<DYNAMIC_DISPATCH: Topics.ORDERS_CREATED>"},
 	}
 	for _, c := range cases {
 		if got := norm(c.kind, c.ch, c.unq, c.m); got != c.want {
@@ -139,13 +140,9 @@ func TestExtractOverridesAndWrite(t *testing.T) {
 	}
 	write(d+"/repos/payment/P.java", `kafkaTemplate.send("payments.authorized", evt);`)
 	write(d+"/repos/ledger/L.java", "@KafkaListener(topics = \"payments.authorized\")\nvoid on(){}")
-	write(d+"/edges.override.yaml", "- src: checkout\n  dst: payment\n  kind: rest\n  channel: /charge\n  role: produce\n")
-
-	ov, err := LoadOverrides(d + "/edges.override.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	edges := append((&Extractor{}).ExtractAll(d+"/repos"), ov...)
+	// an override row, as edgemap.Override.Rows hands it over
+	ov := Edge{Src: "checkout", Kind: "rest", Channel: "/charge", Role: "produce", Repo: "checkout", Line: -1}
+	edges := append((&Extractor{}).ExtractAll(d+"/repos"), ov)
 	db, err := sql.Open("sqlite", d+"/kb.db")
 	if err != nil {
 		t.Fatal(err)
@@ -237,53 +234,118 @@ func TestIsTest(t *testing.T) {
 
 // Real YAML: comments, quotes and flow style work; every bad row fails loudly
 // with its line instead of being dropped.
-func TestLoadOverrides(t *testing.T) {
-	dir := t.TempDir()
-	load := func(body string) ([]Edge, error) {
-		p := filepath.Join(dir, "o.yaml")
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return LoadOverrides(p)
-	}
-	got, err := load(`# runtime-only edges
-- src: checkout
-  kind: kafka
-  channel: orders.created   # main topic
-  role: produce
-- {dst: ledger, kind: rest, channel: '/v1/post', role: consume}
-`)
-	if err != nil {
+func noLine(a Arg) Arg { a.Line = 0; return a }
+
+func TestSCIPCallGate(t *testing.T) {
+	d := t.TempDir() + "/shop"
+	if err := os.MkdirAll(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	want := []Edge{
-		{Src: "checkout", Kind: "kafka", Channel: "orders.created", Role: "produce"},
-		{Dst: "ledger", Kind: "rest", Channel: "/v1/post", Role: "consume"},
+	src := "class Cart {\n  void save() {\n    user.set(\"name\");\n    redis.opsForValue().set(\"cart:1\", v);\n  }\n}\n"
+	if err := os.WriteFile(d+"/Cart.java", []byte(src), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !slices.Equal(got, want) {
-		t.Errorf("rows: %+v, want %+v", got, want)
-	}
-	for body, msg := range map[string]string{
-		"- src: a\n  kind: kafka\n  channel: t\n  role: Produce\n": `:1: role "Produce"`,
-		"- src: a\n  kind: amqp\n  channel: t\n  role: produce\n":  `kind "amqp"`,
-		"- src: a\n  kind: kafka\n  role: produce\n":               "channel is required",
-		"- kind: kafka\n  channel: t\n  role: produce\n":           "needs src",
-		"- src: a\n  kind: kafka\n  chanel: t\n  role: produce\n":  `unknown field "chanel"`,
-		"src: a\n":    "expected a list",
-		"- src: [a\n": "o.yaml",
-	} {
-		if _, err := load(body); err == nil || !strings.Contains(err.Error(), msg) {
-			t.Errorf("%q: want error containing %q, got %v", body, msg, err)
+	redis := func(edges []Edge) (out []string) {
+		for _, e := range edges {
+			if e.Kind == "redis" {
+				out = append(out, e.Channel+"|"+e.Match)
+			}
 		}
+		return out
 	}
-	for _, empty := range []string{"", "# only comments\n# - src: x\n"} {
-		if rows, err := load(empty); err != nil || len(rows) != 0 {
-			t.Errorf("%q: %v %v", empty, rows, err)
-		}
+	// SCIP resolved only line 3 (0-based) to a Redis client
+	gated := &Extractor{Calls: map[string]map[Site]map[string][]Hit{"shop": {{"Cart.java", 3}: {"set": {{Kind: "redis", Role: "produce", Arg: 0}}}}}}
+	if got := redis(gated.ExtractRepo(d)); !slices.Equal(got, []string{"cart:1|"}) {
+		t.Errorf("with SCIP: %v", got)
 	}
-	if rows, err := LoadOverrides(filepath.Join(dir, "missing.yaml")); err != nil || rows != nil {
-		t.Errorf("missing file: %v %v", rows, err)
+	// no SCIP for the repo: names decide, and the edges say so
+	if got := redis((&Extractor{}).ExtractRepo(d)); !slices.Equal(got, []string{"cart:1|name", "name|name"}) {
+		t.Errorf("without SCIP: %v", got)
 	}
 }
 
-func noLine(a Arg) Arg { a.Line = 0; return a }
+// A monorepo service: only files under its root give its edges, under its own
+// name, with paths still relative to the repo.
+func TestExtractServiceRoot(t *testing.T) {
+	d := t.TempDir() + "/shop"
+	for p, src := range map[string]string{
+		"app/cart/Cart.java":       "class Cart {\n  void save() {\n    redis.opsForValue().set(\"cart:1\", v);\n  }\n}\n",
+		"app/catalog/Catalog.java": "class Catalog {\n  void save() {\n    redis.opsForValue().set(\"item:1\", v);\n  }\n}\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(d, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, p), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	for _, e := range (&Extractor{}).ExtractService(d, "cart", "app/cart") {
+		got = append(got, e.Repo+" "+e.Path+" "+e.Channel)
+	}
+	if !slices.Equal(got, []string{"cart app/cart/Cart.java cart:1"}) {
+		t.Errorf("cart's edges: %v", got)
+	}
+}
+
+// A controller's class-level @RequestMapping prefixes its methods' routes (and
+// is no route itself); a Feign client's path prefixes its calls.
+func TestJavaRoutePrefix(t *testing.T) {
+	d := t.TempDir() + "/admin"
+	files := map[string]string{
+		"UmsAdminController.java": "@Controller\n@RequestMapping(\"/admin\")\npublic class UmsAdminController {\n" +
+			"  @PostMapping(\"/login\")\n  public R login() { return null; }\n  @GetMapping(\"info\")\n  public R info() { return null; }\n}\n",
+		"PortalClient.java": "@FeignClient(name = \"mall-portal\", path = \"/sso/\")\npublic interface PortalClient {\n" +
+			"  @PostMapping(\"/login\")\n  R login();\n}\n",
+	}
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for p, src := range files {
+		if err := os.WriteFile(filepath.Join(d, p), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	for _, e := range (&Extractor{}).ExtractRepo(d) {
+		if e.Kind == "rest" {
+			got = append(got, e.Role+" "+e.Channel)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"consume /admin/info", "consume /admin/login", "produce /sso/login"}; !slices.Equal(got, want) {
+		t.Errorf("routes: %v, want %v", got, want)
+	}
+}
+
+// A service's config includes the environment of the Compose service built
+// from its folder, wherever the compose file sits in the repo.
+func TestServiceConfigCompose(t *testing.T) {
+	repo := t.TempDir()
+	files := map[string]string{
+		"order/src/main/resources/application.properties": "spring.kafka.bootstrap-servers=localhost:9092\nserver.port=8080\n",
+		"docker/docker-compose.yml": "services:\n  order:\n    build: ../order\n    environment:\n      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092\n" +
+			"  shipping:\n    build:\n      context: ../shipping\n    environment:\n      - SPRING_DATASOURCE_URL=jdbc:postgresql://db/shipping\n",
+	}
+	for p, body := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, p), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "shipping"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	order := ServiceConfig(repo, "order")
+	if order["SPRING_KAFKA_BOOTSTRAP_SERVERS"] != "kafka:9092" || order["server.port"] != "8080" || order["SPRING_DATASOURCE_URL"] != "" {
+		t.Errorf("order: %v", order)
+	}
+	if ship := ServiceConfig(repo, "shipping"); ship["SPRING_DATASOURCE_URL"] != "jdbc:postgresql://db/shipping" {
+		t.Errorf("shipping (list form, build.context): %v", ship)
+	}
+	if got := EnvKeys("spring.kafka.bootstrap-servers"); !slices.Contains(got, "SPRING_KAFKA_BOOTSTRAP_SERVERS") || !slices.Contains(got, "SPRING_KAFKA_BOOTSTRAPSERVERS") {
+		t.Errorf("env keys: %v", got)
+	}
+}
